@@ -40,14 +40,15 @@ Avoid `CCC_PROXY_PORT_GROK_PATH` — too CCC-specific and “path” is ambiguou
 
 (`serve` flags also work without the subcommand for backward compatibility.)
 
-Auth precedence:
+Auth (subscription path uses the **same** shell stack as interactive `grok`):
 
-1. **Subscription session** from `~/.grok/auth.json` after `grok login` (preferred)
-2. Fallback: `XAI_API_KEY` / `GROK_API_KEY` / `--api-key`
+1. **`LiveSessionAuth`** — `AuthManager` + OIDC refresher + **proactive refresh**
+   background task + sampler `bearer_resolver` (per-request live token).
+   On 401-looking sampler errors, calls `recover_after_unauthorized` once and retries.
+2. Fallback: static `XAI_API_KEY` / session key from disk if LiveSessionAuth cannot start.
 
-No API key is required when a live (non-expired) session `key` is present.
-Optional: `GROK_CLIENT_VERSION` / `GROK_VERSION` for cli-chat-proxy version gate
-(default floor `0.2.106`).
+Requires a prior `grok login`. Optional: `GROK_CLIENT_VERSION` / `GROK_VERSION`
+for cli-chat-proxy version gate (default floor `0.2.106`).
 
 Endpoints: `GET /healthz`, `POST /v1/messages`, `POST /v1/messages/count_tokens`.
 

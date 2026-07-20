@@ -17,6 +17,7 @@ axum = { workspace = true, features = ["macros"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+dirs = "6"
 futures-util = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true }
@@ -42,6 +43,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 
 xai-grok-sampler = { workspace = true }
 xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
+xai-grok-shell = { path = "../xai-grok-shell" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

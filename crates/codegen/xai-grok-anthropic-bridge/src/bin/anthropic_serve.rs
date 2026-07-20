@@ -17,13 +17,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use indexmap::IndexMap;
 use xai_grok_anthropic_bridge::{
-    AuthSource, PORT_FILE_ENV, ServeConfig, claude_bridge_env, default_auth_json_path,
-    loopback_base_url, port_file_from_env, prepare_sticky_port, resolve_auth, run_serve,
-    wait_for_healthz,
+    BridgeAuth, PORT_FILE_ENV, ServeConfig, claude_bridge_env, loopback_base_url,
+    port_file_from_env, prepare_sticky_port, run_serve, wait_for_healthz,
 };
-use xai_grok_sampler::{ApiBackend, AuthScheme, SamplerConfig, SamplingClient};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -180,9 +177,13 @@ async fn run_serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         );
     }
 
-    let client = build_sampling_client(
-        args.auth_json.as_ref(),
+    // Hold LiveSessionAuth for process lifetime (proactive OIDC refresh).
+    let bridge_auth = BridgeAuth::start(
+        args.auth_json.as_deref(),
         args.api_key.as_deref(),
+    )
+    .await?;
+    let client = bridge_auth.sampling_client(
         &args.base_url,
         &args.model,
         args.idle_timeout_secs,
@@ -200,18 +201,13 @@ async fn run_serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         client_identifier: "anthropic-bridge".into(),
         allow_open_bind: args.allow_open_bind,
     };
-    run_serve(serve, client).await
+    run_serve(serve, client, bridge_auth).await
 }
 
 async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
-    // Prove credentials exist before spawning children.
-    let _ = build_sampling_client(
-        args.auth_json.as_ref(),
-        args.api_key.as_deref(),
-        &args.base_url,
-        &args.model,
-        300,
-    )?;
+    // Validate auth can start (child serve process will start its own LiveSessionAuth).
+    let _probe = BridgeAuth::start(args.auth_json.as_deref(), args.api_key.as_deref()).await?;
+    drop(_probe);
 
     let port_file = resolve_port_file_arg(args.port_file.clone());
     // Sidecar: sticky if port file set; else free port (default_port 0 → free).
@@ -246,8 +242,6 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
 
-    // Child should not re-kill itself via sticky prepare — pass port only.
-    // If port_file set, still pass it so the child rewrites/confirms the file.
     if let Some(path) = &port_file {
         serve_cmd.arg("--port-file").arg(path);
     }
@@ -291,74 +285,4 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
         anyhow::bail!("claude exited with {status}");
     }
     Ok(())
-}
-
-fn build_sampling_client(
-    auth_json: Option<&PathBuf>,
-    api_key: Option<&str>,
-    base_url: &str,
-    model: &str,
-    idle_timeout_secs: u64,
-) -> anyhow::Result<SamplingClient> {
-    let auth_path = auth_json
-        .cloned()
-        .unwrap_or_else(default_auth_json_path);
-
-    let resolved = resolve_auth(
-        &auth_path,
-        api_key.filter(|s| !s.is_empty()),
-        std::time::SystemTime::now(),
-    );
-
-    let Some(resolved) = resolved else {
-        anyhow::bail!(
-            "no credentials: run `grok login` (writes {path}) or set XAI_API_KEY",
-            path = auth_path.display()
-        );
-    };
-
-    match resolved.source {
-        AuthSource::Session => {
-            eprintln!(
-                "auth: subscription session from {path} (scope={scope})",
-                path = auth_path.display(),
-                scope = resolved.scope.as_deref().unwrap_or("?")
-            );
-        }
-        AuthSource::ApiKey => {
-            eprintln!("auth: API key (no live session in {})", auth_path.display());
-        }
-    }
-
-    let mut extra_headers = IndexMap::new();
-    if base_url.contains("cli-chat-proxy") {
-        extra_headers.insert("X-XAI-Token-Auth".into(), "xai-grok-cli".into());
-        extra_headers.insert(
-            "x-authenticateresponse".into(),
-            "authenticate-response".into(),
-        );
-        extra_headers.insert("x-grok-client-mode".into(), "headless".into());
-    }
-
-    let sampler_config = SamplerConfig {
-        api_key: Some(resolved.bearer),
-        base_url: base_url.to_string(),
-        model: model.to_string(),
-        api_backend: ApiBackend::Responses,
-        auth_scheme: AuthScheme::Bearer,
-        extra_headers,
-        context_window: 272_000,
-        idle_timeout_secs: Some(idle_timeout_secs),
-        client_identifier: Some("anthropic-bridge".into()),
-        client_version: Some(
-            std::env::var("GROK_CLIENT_VERSION")
-                .or_else(|_| std::env::var("GROK_VERSION"))
-                .unwrap_or_else(|_| "0.2.106".to_string()),
-        ),
-        supports_backend_search: true,
-        ..Default::default()
-    };
-
-    SamplingClient::new(sampler_config)
-        .map_err(|e| anyhow::anyhow!("failed to build SamplingClient: {e}"))
 }

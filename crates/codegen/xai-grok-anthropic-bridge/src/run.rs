@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 use xai_grok_sampler::SamplingClient;
 
 use crate::epoch::SessionRegistry;
+use crate::live_auth::BridgeAuth;
 use crate::serve_config::ServeConfig;
 use crate::server::{AppState, router};
 use crate::traffic::TrafficBus;
@@ -17,7 +18,13 @@ pub struct ServeHandle {
 }
 
 /// Bind and serve until SIGINT/SIGTERM (or forever on platforms without signals).
-pub async fn run_serve(config: ServeConfig, client: SamplingClient) -> anyhow::Result<()> {
+///
+/// `auth` must outlive the server (held in `AppState` for 401 recovery).
+pub async fn run_serve(
+    config: ServeConfig,
+    client: SamplingClient,
+    auth: BridgeAuth,
+) -> anyhow::Result<()> {
     config.validate_bind()?;
 
     let traffic = TrafficBus::new(512, config.capture_dir.clone());
@@ -26,6 +33,7 @@ pub async fn run_serve(config: ServeConfig, client: SamplingClient) -> anyhow::R
         client: Arc::new(client),
         sessions: Arc::new(SessionRegistry::new()),
         traffic,
+        auth: Arc::new(auth),
     };
 
     let addr = SocketAddr::new(config.bind, config.port);

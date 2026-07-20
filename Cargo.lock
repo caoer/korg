@@ -13077,6 +13077,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "dirs 6.0.0",
  "futures-util",
  "http 1.4.0",
  "indexmap",
@@ -13092,6 +13093,7 @@ dependencies = [
  "uuid",
  "xai-grok-sampler",
  "xai-grok-sampling-types",
+ "xai-grok-shell",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@
 mod credentials;
 mod epoch;
 mod launcher;
+mod live_auth;
 mod port_file;
 mod reasoning_signature;
 mod run;
@@ -18,6 +19,8 @@ mod server;
 mod sse;
 mod traffic;
 mod translate;
+
+pub use live_auth::BridgeAuth;
 
 pub use credentials::{
     AuthSource, ResolvedAuth, default_auth_json_path, load_session_from_contents, resolve_auth,

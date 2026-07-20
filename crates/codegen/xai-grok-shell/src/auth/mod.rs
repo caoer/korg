@@ -37,6 +37,8 @@ pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
 pub use manager::{AuthManager, shared_api_key_provider};
 pub use meta::{AuthMeta, GateInfo};
 pub use model::{AuthMode, GrokAuth, lookup_auth};
+mod live_session;
+pub use live_session::{AuthManagerBearerResolver, LiveSessionAuth};
 pub(crate) use model::{
     TOKEN_TTL, UserInfo, default_coding_data_retention_opt_out, is_expired, token_suffix,
 };

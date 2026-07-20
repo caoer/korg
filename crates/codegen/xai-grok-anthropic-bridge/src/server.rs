@@ -16,6 +16,7 @@ use uuid::Uuid;
 use xai_grok_sampler::SamplingClient;
 
 use crate::epoch::SessionRegistry;
+use crate::live_auth::BridgeAuth;
 use crate::serve_config::ServeConfig;
 use crate::sse;
 use crate::traffic::{TrafficBus, TrafficSide};
@@ -29,6 +30,8 @@ pub struct AppState {
     pub client: Arc<SamplingClient>,
     pub sessions: Arc<SessionRegistry>,
     pub traffic: TrafficBus,
+    /// Live OIDC session for 401 recovery (None when static API key).
+    pub auth: Arc<BridgeAuth>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -128,6 +131,46 @@ async fn messages(
     stream_messages_response(state, req_id, translated).await
 }
 
+/// Open a Responses stream; on auth-looking failure, run OIDC recovery once and retry.
+async fn open_conversation_stream(
+    state: &AppState,
+    request: xai_grok_sampling_types::conversation::ConversationRequest,
+) -> xai_grok_sampling_types::Result<(
+    futures_util::stream::BoxStream<
+        'static,
+        xai_grok_sampling_types::Result<xai_grok_sampling_types::rs::ResponseStreamEvent>,
+    >,
+    Option<xai_grok_sampling_types::ResponseModelMetadata>,
+    Option<xai_grok_sampler::doom_loop::DoomLoopSignalCollector>,
+)> {
+    match state
+        .client
+        .conversation_stream_responses(request.clone())
+        .await
+    {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            let msg = e.to_string();
+            let lower = msg.to_ascii_lowercase();
+            let authish = msg.contains("401")
+                || lower.contains("unauthor")
+                || lower.contains("authentication");
+            if authish {
+                if let Some(session) = state.auth.session() {
+                    tracing::warn!(
+                        %msg,
+                        "auth error from sampler; attempting LiveSessionAuth recovery"
+                    );
+                    if session.recover_after_unauthorized().await {
+                        return state.client.conversation_stream_responses(request).await;
+                    }
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 async fn non_stream_messages(
     state: &AppState,
     req_id: &str,
@@ -138,9 +181,7 @@ async fn non_stream_messages(
         .model
         .clone()
         .unwrap_or_else(|| state.config.default_model.clone());
-    let (mut stream, _meta, _doom) = state
-        .client
-        .conversation_stream_responses(request)
+    let (mut stream, _meta, _doom) = open_conversation_stream(state, request)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -262,16 +303,14 @@ async fn stream_messages_response(
 
         send(sse::message_start(&message_id, &model)).await;
 
-        let stream_result = state.client.conversation_stream_responses(request).await;
+        let stream_result = open_conversation_stream(&state, request).await;
         let (mut stream, _meta, _doom) = match stream_result {
             Ok(s) => s,
             Err(e) => {
                 let _ = tx
-                    .send(Ok(sse::encode_out(
-                        &AnthropicOut::Error {
-                            message: e.to_string(),
-                        },
-                    )[0]
+                    .send(Ok(sse::encode_out(&AnthropicOut::Error {
+                        message: e.to_string(),
+                    })[0]
                         .clone()))
                     .await;
                 return;

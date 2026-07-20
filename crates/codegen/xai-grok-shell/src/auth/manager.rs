@@ -714,7 +714,11 @@ impl AuthManager {
 
     /// In-memory bearer regardless of the early-invalidation buffer.
     /// Prefer [`Self::auth`] when `.await` is available.
-    pub(crate) fn current_or_expired(&self) -> Option<GrokAuth> {
+    ///
+    /// Public for long-lived consumers (e.g. anthropic-bridge) that implement
+    /// a sync [`xai_grok_sampler::BearerResolver`] while proactive refresh
+    /// keeps this value hot.
+    pub fn current_or_expired(&self) -> Option<GrokAuth> {
         self.current().or_else(|| self.expired_auth())
     }
 
@@ -2004,6 +2008,13 @@ impl AuthManager {
             .is_ok()
     }
 
+    /// Public 401 recovery entry for external long-lived clients (bridge, etc.).
+    /// Same path as sampling's `ShellAuthCredentialProvider::refresh_after_unauthorized`.
+    pub async fn recover_after_unauthorized(self: &Arc<Self>) -> bool {
+        self.try_recover_unauthorized(crate::auth::recovery::RecoverySource::Background)
+            .await
+    }
+
     pub(crate) fn record_manual_auth(
         &self,
         snapshot: &crate::auth::recovery::RejectedAuth,
@@ -2033,7 +2044,10 @@ impl AuthManager {
     /// computed by [`compute_proactive_sleep`]; see its body for the
     /// four non-busy-loop guards (permanent_failure, non-refreshable
     /// type, no refresher, no expires_at).
-    pub(crate) fn start_proactive_refresh(self: &Arc<Self>, cancel: CancellationToken) {
+    ///
+    /// Public so long-lived processes (pager, agent, anthropic-bridge)
+    /// can activate the same proactive OIDC refresh loop.
+    pub fn start_proactive_refresh(self: &Arc<Self>, cancel: CancellationToken) {
         use std::sync::atomic::Ordering;
         // AcqRel/Acquire publishes the spawned task's captured Arc to
         // any thread that observes the bool as `true`; SeqCst would also
