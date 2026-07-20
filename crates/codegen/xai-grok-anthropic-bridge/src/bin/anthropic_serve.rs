@@ -1,24 +1,50 @@
 //! Standalone binary: `grok-anthropic-serve`
 //!
+//! Subcommands:
+//! - `serve` (default) — run the Anthropic façade
+//! - `claude` — spawn serve on an ephemeral port, run `claude` with env, tear down
+//!
 //! Auth precedence: subscription session in `~/.grok/auth.json` (after `grok login`),
 //! then `XAI_API_KEY` / `GROK_API_KEY` / `--api-key`.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use xai_grok_anthropic_bridge::{
-    AuthSource, ServeConfig, default_auth_json_path, resolve_auth, run_serve,
+    AuthSource, ServeConfig, claude_bridge_env, default_auth_json_path, free_loopback_port,
+    loopback_base_url, resolve_auth, run_serve, wait_for_healthz,
 };
 use xai_grok_sampler::{ApiBackend, AuthScheme, SamplerConfig, SamplingClient};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "grok-anthropic-serve",
-    about = "Anthropic Messages façade for Claude Code → official Grok sampler (subscription session or API key)"
+    about = "Anthropic Messages façade for Claude Code → official Grok sampler",
+    subcommand_required = false
 )]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// When no subcommand is given, treat remaining flags as `serve`.
+    #[command(flatten)]
+    serve: ServeArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Run the loopback Anthropic Messages server.
+    Serve(ServeArgs),
+    /// Spawn serve as a sidecar and run Claude Code against it.
+    Claude(ClaudeArgs),
+}
+
+#[derive(Debug, Clone, Parser)]
+struct ServeArgs {
     /// Bind address (loopback by default).
     #[arg(long, default_value = "127.0.0.1")]
     bind: IpAddr,
@@ -31,7 +57,7 @@ struct Args {
     #[arg(long, short = 'm', default_value = "grok-4.5")]
     model: String,
 
-    /// Disable future TUI (phase 0 is always plain logs).
+    /// Disable future TUI (currently always plain logs).
     #[arg(long, default_value_t = true)]
     no_tui: bool,
 
@@ -55,14 +81,48 @@ struct Args {
     #[arg(long, default_value = "https://cli-chat-proxy.grok.com/v1")]
     base_url: String,
 
-    /// API key fallback only (env: XAI_API_KEY / GROK_API_KEY). Session in
-    /// `~/.grok/auth.json` is preferred when present and not expired.
+    /// API key fallback (env: XAI_API_KEY). Session in auth.json is preferred.
     #[arg(long, env = "XAI_API_KEY")]
     api_key: Option<String>,
 
-    /// Override path to auth.json (default: $GROK_HOME/auth.json or ~/.grok/auth.json).
+    /// Override path to auth.json.
     #[arg(long)]
     auth_json: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Parser)]
+struct ClaudeArgs {
+    /// Default upstream model id (also ANTHROPIC_MODEL / SMALL_FAST).
+    #[arg(long, short = 'm', default_value = "grok-4.5")]
+    model: String,
+
+    /// Dual-side capture dir for the sidecar serve.
+    #[arg(long)]
+    capture_dir: Option<PathBuf>,
+
+    /// Path to `claude` binary (default: look up on PATH).
+    #[arg(long, default_value = "claude")]
+    claude_bin: PathBuf,
+
+    /// Extra args after `--` are forwarded to Claude.
+    #[arg(last = true)]
+    claude_args: Vec<String>,
+
+    /// API key fallback (session preferred).
+    #[arg(long, env = "XAI_API_KEY")]
+    api_key: Option<String>,
+
+    /// Override path to auth.json.
+    #[arg(long)]
+    auth_json: Option<PathBuf>,
+
+    /// Sampling base URL for the sidecar.
+    #[arg(long, default_value = "https://cli-chat-proxy.grok.com/v1")]
+    base_url: String,
+
+    /// Health wait timeout seconds.
+    #[arg(long, default_value_t = 15)]
+    health_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -75,31 +135,126 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
+    match cli.command {
+        None => run_serve_cmd(cli.serve).await,
+        Some(Command::Serve(args)) => run_serve_cmd(args).await,
+        Some(Command::Claude(args)) => run_claude_sidecar(args).await,
+    }
+}
 
-    let auth_path = args
-        .auth_json
-        .clone()
+async fn run_serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
+    let client = build_sampling_client(
+        args.auth_json.as_ref(),
+        args.api_key.as_deref(),
+        &args.base_url,
+        &args.model,
+        args.idle_timeout_secs,
+    )?;
+
+    let serve = ServeConfig {
+        bind: args.bind,
+        port: args.port,
+        default_model: args.model,
+        allow_models: Vec::new(),
+        no_tui: args.no_tui,
+        capture_dir: args.capture_dir,
+        idle_timeout_secs: args.idle_timeout_secs,
+        usage_scale: args.usage_scale,
+        client_identifier: "anthropic-bridge".into(),
+        allow_open_bind: args.allow_open_bind,
+    };
+    run_serve(serve, client).await
+}
+
+async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
+    // Prove credentials exist before spawning children.
+    let _ = build_sampling_client(
+        args.auth_json.as_ref(),
+        args.api_key.as_deref(),
+        &args.base_url,
+        &args.model,
+        300,
+    )?;
+
+    let port = free_loopback_port()?;
+    let base = loopback_base_url(port);
+    eprintln!("sidecar: starting serve on {base}");
+
+    let self_exe = std::env::current_exe()?;
+    let mut serve_cmd = tokio::process::Command::new(&self_exe);
+    serve_cmd
+        .arg("serve")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--model")
+        .arg(&args.model)
+        .arg("--base-url")
+        .arg(&args.base_url)
+        // Keep sidecar stderr quiet so Claude's TTY is not flooded with SSE logs.
+        .env("RUST_LOG", "warn,xai_grok_anthropic_bridge=info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+
+    if let Some(dir) = &args.capture_dir {
+        serve_cmd.arg("--capture-dir").arg(dir);
+    }
+    if let Some(path) = &args.auth_json {
+        serve_cmd.arg("--auth-json").arg(path);
+    }
+    if let Some(key) = &args.api_key {
+        serve_cmd.arg("--api-key").arg(key);
+    }
+
+    let mut child = serve_cmd.spawn()?;
+
+    let health = wait_for_healthz(&base, Duration::from_secs(args.health_timeout_secs)).await;
+    if let Err(e) = health {
+        let _ = child.kill().await;
+        return Err(e);
+    }
+    eprintln!("sidecar: healthz ok; launching {}", args.claude_bin.display());
+
+    let env_map = claude_bridge_env(&base, &args.model);
+    let mut claude = std::process::Command::new(&args.claude_bin);
+    claude.args(&args.claude_args);
+    for (k, v) in &env_map {
+        claude.env(k, v);
+    }
+    // Inherit stdio for interactive TUI.
+    claude.stdin(Stdio::inherit());
+    claude.stdout(Stdio::inherit());
+    claude.stderr(Stdio::inherit());
+
+    let status = claude.status();
+
+    // Tear down serve regardless of Claude exit.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+
+    let status = status?;
+    if !status.success() {
+        anyhow::bail!("claude exited with {status}");
+    }
+    Ok(())
+}
+
+fn build_sampling_client(
+    auth_json: Option<&PathBuf>,
+    api_key: Option<&str>,
+    base_url: &str,
+    model: &str,
+    idle_timeout_secs: u64,
+) -> anyhow::Result<SamplingClient> {
+    let auth_path = auth_json
+        .cloned()
         .unwrap_or_else(default_auth_json_path);
 
-    // Prefer session from auth.json; only then API key env/flag.
-    // Unset API key env is still available as fallback inside resolve_auth.
-    let api_override = args
-        .api_key
-        .as_deref()
-        .or_else(|| {
-            // clap already maps XAI_API_KEY into api_key when set; also allow GROK_API_KEY
-            // only when --api-key / XAI_API_KEY absent — handled inside resolve_auth when
-            // we pass None for override after stripping empty.
-            None
-        })
-        .filter(|s| !s.is_empty());
-
-    // If clap filled api_key from XAI_API_KEY, still prefer session: pass it as override
-    // only after session miss. resolve_auth does session first.
     let resolved = resolve_auth(
         &auth_path,
-        args.api_key.as_deref().filter(|s| !s.is_empty()),
+        api_key.filter(|s| !s.is_empty()),
         std::time::SystemTime::now(),
     );
 
@@ -124,8 +279,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut extra_headers = IndexMap::new();
-    if args.base_url.contains("cli-chat-proxy") {
-        // Match shell inject_url_derived_headers for cli-chat-proxy.
+    if base_url.contains("cli-chat-proxy") {
         extra_headers.insert("X-XAI-Token-Auth".into(), "xai-grok-cli".into());
         extra_headers.insert(
             "x-authenticateresponse".into(),
@@ -136,17 +290,14 @@ async fn main() -> anyhow::Result<()> {
 
     let sampler_config = SamplerConfig {
         api_key: Some(resolved.bearer),
-        base_url: args.base_url,
-        model: args.model.clone(),
+        base_url: base_url.to_string(),
+        model: model.to_string(),
         api_backend: ApiBackend::Responses,
         auth_scheme: AuthScheme::Bearer,
         extra_headers,
         context_window: 272_000,
-        idle_timeout_secs: Some(args.idle_timeout_secs),
+        idle_timeout_secs: Some(idle_timeout_secs),
         client_identifier: Some("anthropic-bridge".into()),
-        // cli-chat-proxy gates on x-grok-client-version; the bridge crate's
-        // own package version is independent of the shipped `grok` CLI.
-        // Prefer GROK_CLIENT_VERSION / GROK_VERSION, else a current floor.
         client_version: Some(
             std::env::var("GROK_CLIENT_VERSION")
                 .or_else(|_| std::env::var("GROK_VERSION"))
@@ -156,22 +307,6 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let client = SamplingClient::new(sampler_config)
-        .map_err(|e| anyhow::anyhow!("failed to build SamplingClient: {e}"))?;
-
-    let serve = ServeConfig {
-        bind: args.bind,
-        port: args.port,
-        default_model: args.model,
-        allow_models: Vec::new(),
-        no_tui: args.no_tui,
-        capture_dir: args.capture_dir,
-        idle_timeout_secs: args.idle_timeout_secs,
-        usage_scale: args.usage_scale,
-        client_identifier: "anthropic-bridge".into(),
-        allow_open_bind: args.allow_open_bind,
-    };
-
-    let _ = api_override; // reserved for future CLI-only override that skips session
-    run_serve(serve, client).await
+    SamplingClient::new(sampler_config)
+        .map_err(|e| anyhow::anyhow!("failed to build SamplingClient: {e}"))
 }

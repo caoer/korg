@@ -9,6 +9,7 @@
 
 mod credentials;
 mod epoch;
+mod launcher;
 mod reasoning_signature;
 mod run;
 mod serve_config;
@@ -22,6 +23,9 @@ pub use credentials::{
     resolve_auth_default,
 };
 pub use epoch::{SessionEpoch, SessionRegistry};
+pub use launcher::{
+    claude_bridge_env, free_loopback_port, loopback_base_url, wait_for_healthz,
+};
 pub use reasoning_signature::{
     PendingReasoning, ReasoningReplay, decode_reasoning_signature, encode_reasoning_signature,
 };

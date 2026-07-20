@@ -3,21 +3,27 @@
 Anthropic Messages façade so **Claude Code** can use **Grok** via the official
 `xai-grok-sampler` client (not a reimplemented HTTP client).
 
-## Phase 0 (current)
+## Usage
 
 ```bash
-# From grok-build workspace:
-cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- \
-  --port 18765 --model grok-4.5 --capture-dir /tmp/ab-capture
+# From grok-build workspace — long-lived serve:
+cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve \
+  --port 18766 --model grok-4.5 --capture-dir /tmp/ab-capture
 
-# Point Claude Code at it:
-export ANTHROPIC_BASE_URL=http://127.0.0.1:18765
+# Sidecar (spawn serve, run Claude, tear down on exit):
+cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- claude \
+  --model grok-4.5
+
+# Manual Claude pointing at an existing serve:
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18766
 export ANTHROPIC_AUTH_TOKEN=unused
 export ANTHROPIC_MODEL=grok-4.5
 export ANTHROPIC_SMALL_FAST_MODEL=grok-4.5
 export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 claude
 ```
+
+(`serve` flags also work without the subcommand for backward compatibility.)
 
 Auth precedence:
 

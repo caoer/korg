@@ -13080,6 +13080,7 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "indexmap",
+ "reqwest 0.12.24",
  "serde",
  "serde_json",
  "tempfile",
