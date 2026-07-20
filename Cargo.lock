@@ -13068,6 +13068,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-anthropic-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "base64",
+ "bytes",
+ "clap",
+ "futures-util",
+ "http 1.4.0",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "xai-grok-sampler",
+ "xai-grok-sampling-types",
+]
+
+[[package]]
 name = "xai-grok-auth"
 version = "0.1.0"
 dependencies = [

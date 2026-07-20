@@ -1,0 +1,49 @@
+[package]
+name = "xai-grok-anthropic-bridge"
+version = "0.1.0"
+edition.workspace = true
+license = "Apache-2.0"
+description = "Anthropic Messages façade for Claude Code → official Grok sampler (anthropic-serve)"
+publish = false
+
+[[bin]]
+name = "grok-anthropic-serve"
+path = "src/bin/anthropic_serve.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+axum = { workspace = true, features = ["macros"] }
+base64 = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+futures-util = { workspace = true }
+http = { workspace = true }
+indexmap = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "fs",
+    "io-util",
+] }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+xai-grok-sampler = { workspace = true }
+xai-grok-sampling-types = { path = "../xai-grok-sampling-types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true
