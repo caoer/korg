@@ -6,11 +6,14 @@ Anthropic Messages façade so **Claude Code** can use **Grok** via the official
 ## Usage
 
 ```bash
-# Sticky port across restarts (recommended for tooling):
+# Sticky port + dual-pane traffic TUI (default when stdout is a TTY):
 export GROK_ANTHROPIC_SERVE_PORT_FILE="$HOME/.grok/anthropic-serve.port"
-cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve --model grok-4.5
+cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve \
+  --model grok-4.5 --capture-dir /tmp/ab-capture
+# Keys: q quit · j/k request list · Tab panes · [/] scroll · g latest · w dump
 # → picks free port first time, writes it to the file; next start reuses it
 #   (kills prior grok-anthropic-serve on that port first). File is kept on exit.
+# Plain logs: add --no-tui
 
 # Long-lived serve on a fixed port:
 cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve \

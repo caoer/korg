@@ -17,10 +17,12 @@ axum = { workspace = true, features = ["macros"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+crossterm = { workspace = true }
 dirs = "6"
 futures-util = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true }
+ratatui = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

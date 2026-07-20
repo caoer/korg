@@ -66,8 +66,8 @@ struct ServeArgs {
     #[arg(long, short = 'm', default_value = "grok-4.5")]
     model: String,
 
-    /// Disable future TUI (currently always plain logs).
-    #[arg(long, default_value_t = true)]
+    /// Disable dual-pane traffic TUI (default: TUI on when stdout is a TTY).
+    #[arg(long, default_value_t = false)]
     no_tui: bool,
 
     /// Write dual-side JSON captures under this directory.
@@ -235,12 +235,14 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
         .arg(&args.model)
         .arg("--base-url")
         .arg(&args.base_url)
-        // Keep sidecar stderr quiet so Claude's TTY is not flooded with SSE logs.
+        // Keep sidecar quiet: no TUI (Claude owns the TTY), muted sampler logs.
         .env("RUST_LOG", "warn,xai_grok_anthropic_bridge=info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+
+    serve_cmd.arg("--no-tui");
 
     if let Some(path) = &port_file {
         serve_cmd.arg("--port-file").arg(path);

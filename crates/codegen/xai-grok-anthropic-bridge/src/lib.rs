@@ -19,6 +19,7 @@ mod server;
 mod sse;
 mod traffic;
 mod translate;
+mod tui;
 
 pub use live_auth::BridgeAuth;
 

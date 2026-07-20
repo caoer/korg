@@ -35,7 +35,8 @@ impl Default for ServeConfig {
             port: 18765,
             default_model: "grok-4.5".to_string(),
             allow_models: Vec::new(),
-            no_tui: true,
+            no_tui: false,
+
             capture_dir: None,
             idle_timeout_secs: 300,
             usage_scale: None,
