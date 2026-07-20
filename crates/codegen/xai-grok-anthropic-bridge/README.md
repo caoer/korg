@@ -6,22 +6,37 @@ Anthropic Messages façade so **Claude Code** can use **Grok** via the official
 ## Usage
 
 ```bash
-# From grok-build workspace — long-lived serve:
-cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve \
-  --port 18766 --model grok-4.5 --capture-dir /tmp/ab-capture
+# Sticky port across restarts (recommended for tooling):
+export GROK_ANTHROPIC_SERVE_PORT_FILE="$HOME/.grok/anthropic-serve.port"
+cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve --model grok-4.5
+# → picks free port first time, writes it to the file; next start reuses it
+#   (kills prior grok-anthropic-serve on that port first). File is kept on exit.
 
-# Sidecar (spawn serve, run Claude, tear down on exit):
+# Long-lived serve on a fixed port:
+cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve \
+  --port 18766 --model grok-4.5
+
+# Sidecar (spawn serve, run Claude, tear down serve; sticky port file still kept):
 cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- claude \
   --model grok-4.5
 
 # Manual Claude pointing at an existing serve:
-export ANTHROPIC_BASE_URL=http://127.0.0.1:18766
+export ANTHROPIC_BASE_URL=http://127.0.0.1:$(cat "$GROK_ANTHROPIC_SERVE_PORT_FILE")
 export ANTHROPIC_AUTH_TOKEN=unused
 export ANTHROPIC_MODEL=grok-4.5
 export ANTHROPIC_SMALL_FAST_MODEL=grok-4.5
 export CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK=1
 claude
 ```
+
+### Env / naming
+
+| Name | Meaning |
+|------|---------|
+| **`GROK_ANTHROPIC_SERVE_PORT_FILE`** | Path to a file storing the decimal listen port (preferred name) |
+| `--port-file PATH` | Same as the env (CLI wins if both set) |
+
+Avoid `CCC_PROXY_PORT_GROK_PATH` — too CCC-specific and “path” is ambiguous. The name above matches the binary and states that the value is a **file path**, not the port itself.
 
 (`serve` flags also work without the subcommand for backward compatibility.)
 

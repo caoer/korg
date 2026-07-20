@@ -1,18 +1,11 @@
-//! Sidecar launcher helpers: free port, Claude env, health wait.
+//! Sidecar launcher helpers: Claude env, health wait.
+//!
+//! Port pick/kill lives in [`crate::port_file`].
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::time::Duration;
 
-/// Bind `127.0.0.1:0` to reserve an ephemeral loopback port, then drop the
-/// listener so the serve child can re-bind it. Small TOCTOU race is acceptable
-/// for a local developer tool.
-pub fn free_loopback_port() -> std::io::Result<u16> {
-    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
-    Ok(port)
-}
+pub use crate::port_file::free_loopback_port;
 
 /// Environment overrides for Claude Code pointing at a bridge serve instance.
 pub fn claude_bridge_env(base_url: &str, model: &str) -> HashMap<String, String> {

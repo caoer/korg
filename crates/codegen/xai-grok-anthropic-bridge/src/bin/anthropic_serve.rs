@@ -2,10 +2,14 @@
 //!
 //! Subcommands:
 //! - `serve` (default) — run the Anthropic façade
-//! - `claude` — spawn serve on an ephemeral port, run `claude` with env, tear down
+//! - `claude` — spawn serve (sticky port file supported), run `claude`, tear down serve
 //!
-//! Auth precedence: subscription session in `~/.grok/auth.json` (after `grok login`),
-//! then `XAI_API_KEY` / `GROK_API_KEY` / `--api-key`.
+//! Sticky port file (optional):
+//!   env `GROK_ANTHROPIC_SERVE_PORT_FILE` or `--port-file PATH`
+//!   File holds a decimal port; not deleted on exit. Next start reuses it and
+//!   replaces any previous `grok-anthropic-serve` listener on that port.
+//!
+//! Auth: subscription session in `~/.grok/auth.json`, else API key.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -15,8 +19,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use indexmap::IndexMap;
 use xai_grok_anthropic_bridge::{
-    AuthSource, ServeConfig, claude_bridge_env, default_auth_json_path, free_loopback_port,
-    loopback_base_url, resolve_auth, run_serve, wait_for_healthz,
+    AuthSource, PORT_FILE_ENV, ServeConfig, claude_bridge_env, default_auth_json_path,
+    loopback_base_url, port_file_from_env, prepare_sticky_port, resolve_auth, run_serve,
+    wait_for_healthz,
 };
 use xai_grok_sampler::{ApiBackend, AuthScheme, SamplerConfig, SamplingClient};
 
@@ -49,9 +54,16 @@ struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1")]
     bind: IpAddr,
 
-    /// Port (`0` = ephemeral).
-    #[arg(long, short = 'p', default_value_t = 18765)]
-    port: u16,
+    /// Listen port. With a sticky port file, omit to reuse the stored port
+    /// (or pick free and write it). Without a port file, default is 18765.
+    /// Use `0` to force an ephemeral port (still written to the sticky file if set).
+    #[arg(long, short = 'p')]
+    port: Option<u16>,
+
+    /// Sticky port file path (overrides env `GROK_ANTHROPIC_SERVE_PORT_FILE`).
+    /// Contents: one decimal port. Not deleted on exit.
+    #[arg(long, env = "GROK_ANTHROPIC_SERVE_PORT_FILE")]
+    port_file: Option<PathBuf>,
 
     /// Default upstream model id.
     #[arg(long, short = 'm', default_value = "grok-4.5")]
@@ -95,6 +107,14 @@ struct ClaudeArgs {
     /// Default upstream model id (also ANTHROPIC_MODEL / SMALL_FAST).
     #[arg(long, short = 'm', default_value = "grok-4.5")]
     model: String,
+
+    /// Optional fixed port for the sidecar serve (sticky file still updated).
+    #[arg(long, short = 'p')]
+    port: Option<u16>,
+
+    /// Sticky port file (same as serve; env `GROK_ANTHROPIC_SERVE_PORT_FILE`).
+    #[arg(long, env = "GROK_ANTHROPIC_SERVE_PORT_FILE")]
+    port_file: Option<PathBuf>,
 
     /// Dual-side capture dir for the sidecar serve.
     #[arg(long)]
@@ -143,7 +163,23 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+fn resolve_port_file_arg(cli_path: Option<PathBuf>) -> Option<PathBuf> {
+    cli_path.or_else(port_file_from_env)
+}
+
 async fn run_serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
+    let port_file = resolve_port_file_arg(args.port_file.clone());
+    let res = prepare_sticky_port(args.port, 18765, port_file.as_deref())
+        .map_err(|e| anyhow::anyhow!("port resolve: {e}"))?;
+    if let Some(path) = &res.path {
+        eprintln!(
+            "port-file: {path} → {port} ({env})",
+            path = path.display(),
+            port = res.port,
+            env = PORT_FILE_ENV
+        );
+    }
+
     let client = build_sampling_client(
         args.auth_json.as_ref(),
         args.api_key.as_deref(),
@@ -154,7 +190,7 @@ async fn run_serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
 
     let serve = ServeConfig {
         bind: args.bind,
-        port: args.port,
+        port: res.port,
         default_model: args.model,
         allow_models: Vec::new(),
         no_tui: args.no_tui,
@@ -177,8 +213,20 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
         300,
     )?;
 
-    let port = free_loopback_port()?;
+    let port_file = resolve_port_file_arg(args.port_file.clone());
+    // Sidecar: sticky if port file set; else free port (default_port 0 → free).
+    let default = if port_file.is_some() { 18765 } else { 0 };
+    let res = prepare_sticky_port(args.port, default, port_file.as_deref())
+        .map_err(|e| anyhow::anyhow!("port resolve: {e}"))?;
+    let port = res.port;
     let base = loopback_base_url(port);
+    if let Some(path) = &res.path {
+        eprintln!(
+            "port-file: {path} → {port}",
+            path = path.display(),
+            port = port
+        );
+    }
     eprintln!("sidecar: starting serve on {base}");
 
     let self_exe = std::env::current_exe()?;
@@ -198,6 +246,11 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
 
+    // Child should not re-kill itself via sticky prepare — pass port only.
+    // If port_file set, still pass it so the child rewrites/confirms the file.
+    if let Some(path) = &port_file {
+        serve_cmd.arg("--port-file").arg(path);
+    }
     if let Some(dir) = &args.capture_dir {
         serve_cmd.arg("--capture-dir").arg(dir);
     }
@@ -223,14 +276,13 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
     for (k, v) in &env_map {
         claude.env(k, v);
     }
-    // Inherit stdio for interactive TUI.
     claude.stdin(Stdio::inherit());
     claude.stdout(Stdio::inherit());
     claude.stderr(Stdio::inherit());
 
     let status = claude.status();
 
-    // Tear down serve regardless of Claude exit.
+    // Tear down serve; keep sticky port file for next time.
     let _ = child.kill().await;
     let _ = child.wait().await;
 
