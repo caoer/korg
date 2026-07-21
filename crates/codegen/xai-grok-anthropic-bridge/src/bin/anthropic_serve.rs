@@ -23,9 +23,16 @@ use xai_grok_anthropic_bridge::{
     port_file_from_env, prepare_sticky_port, run_serve, wait_for_healthz,
 };
 
+/// Overridden in CI via `KORG_RELEASE_VERSION` (e.g. `0.1.0+abc1234`).
+const VERSION: &str = match option_env!("KORG_RELEASE_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "grok-anthropic-serve",
+    version = VERSION,
     about = "Anthropic Messages façade for Claude Code → official Grok sampler",
     subcommand_required = false
 )]

@@ -3,6 +3,56 @@
 Anthropic Messages façade so **Claude Code** can use **Grok** via the official
 `xai-grok-sampler` client (not a reimplemented HTTP client).
 
+## Install (prebuilt)
+
+Published from GitHub Actions on every `main` push and on `v*` tags.
+
+```bash
+# Installer (detects OS/arch → ~/.local/bin)
+curl -fsSL https://github.com/caoer/korg/releases/latest/download/install.sh | bash
+
+# Or pin a version tag:
+curl -fsSL https://github.com/caoer/korg/releases/latest/download/install.sh | VERSION=v0.1.0 bash
+```
+
+### Stable URLs for other apps
+
+| What | URL |
+|------|-----|
+| **Manifest (JSON)** | https://github.com/caoer/korg/releases/latest/download/latest.json |
+| Checksums | https://github.com/caoer/korg/releases/latest/download/SHA256SUMS |
+| Installer | https://github.com/caoer/korg/releases/latest/download/install.sh |
+| macOS arm64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-aarch64-apple-darwin.tar.gz |
+| macOS x86_64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-x86_64-apple-darwin.tar.gz |
+| Linux x86_64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-x86_64-unknown-linux-gnu.tar.gz |
+| Linux arm64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-aarch64-unknown-linux-gnu.tar.gz |
+| Release page | https://github.com/caoer/korg/releases/latest |
+
+`latest.json` shape (abbreviated):
+
+```json
+{
+  "name": "grok-anthropic-serve",
+  "version": "0.1.0+abc1234",
+  "tag": "latest",
+  "git_sha": "...",
+  "assets": {
+    "aarch64-apple-darwin": {
+      "url": "https://github.com/caoer/korg/releases/download/latest/grok-anthropic-serve-aarch64-apple-darwin.tar.gz",
+      "latest_url": "https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-aarch64-apple-darwin.tar.gz",
+      "sha256": "..."
+    }
+  }
+}
+```
+
+Example (shell):
+
+```bash
+curl -fsSL https://github.com/caoer/korg/releases/latest/download/latest.json \
+  | jq -r '.assets["aarch64-apple-darwin"].latest_url'
+```
+
 ## Usage
 
 ```bash

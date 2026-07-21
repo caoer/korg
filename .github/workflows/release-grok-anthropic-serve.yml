@@ -1,0 +1,354 @@
+# Build and publish grok-anthropic-serve multi-platform binaries.
+#
+# Stable "latest" download URLs (always point at the newest successful release):
+#   https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-<target>.tar.gz
+#   https://github.com/caoer/korg/releases/latest/download/latest.json
+#   https://github.com/caoer/korg/releases/latest/download/SHA256SUMS
+#   https://github.com/caoer/korg/releases/latest/download/install.sh
+#
+# Triggers:
+#   - push to main (rolling latest)
+#   - version tags v* (versioned release, also becomes latest)
+#   - workflow_dispatch
+
+name: Release grok-anthropic-serve
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - "crates/codegen/xai-grok-anthropic-bridge/**"
+      - "crates/codegen/xai-grok-sampler/**"
+      - "crates/codegen/xai-grok-shell/**"
+      - "crates/codegen/xai-grok-sampling-types/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - ".github/workflows/release-grok-anthropic-serve.yml"
+      - "scripts/install-grok-anthropic-serve.sh"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (empty = latest rolling)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Avoid aarch64-linux neoverse-v2 rustflags from .cargo/config.toml on generic GHA ARM.
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C force-unwind-tables=yes"
+  # release-dist PROFILE != "release" → shell build.rs skips bundling ripgrep (good).
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config protobuf-compiler \
+            libssl-dev ca-certificates curl
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake protobuf pkg-config || true
+          which protoc
+          protoc --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: anthropic-serve-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Compute release version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA_SHORT="${GITHUB_SHA::7}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            VER="${{ github.event.inputs.tag }}"
+            VER="${VER#v}"
+          else
+            VER="0.1.0+${SHA_SHORT}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VER}"
+
+      - name: Build release-dist binary
+        env:
+          KORG_RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+          PROTOC: ${{ runner.os == 'Linux' && '/usr/bin/protoc' || '' }}
+        run: |
+          set -euo pipefail
+          # Ensure protoc is available for tools-api build scripts.
+          command -v protoc
+          protoc --version
+          cargo build \
+            -p xai-grok-anthropic-bridge \
+            --bin grok-anthropic-serve \
+            --profile release-dist \
+            --target "${{ matrix.target }}"
+          BIN="target/${{ matrix.target }}/release-dist/grok-anthropic-serve"
+          test -x "$BIN"
+          # Strip debug symbols for a smaller ship binary (profile keeps them for .dSYM extraction).
+          if command -v strip >/dev/null 2>&1; then
+            strip -x "$BIN" 2>/dev/null || strip "$BIN" || true
+          fi
+          ls -lh "$BIN"
+          "$BIN" --version || true
+          "$BIN" --help | head -20
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          BIN="target/${TARGET}/release-dist/grok-anthropic-serve"
+          STAGE="dist/${TARGET}"
+          mkdir -p "$STAGE"
+          cp "$BIN" "$STAGE/grok-anthropic-serve"
+          chmod +x "$STAGE/grok-anthropic-serve"
+          # Tiny sidecar with version metadata for installers / other apps.
+          cat > "$STAGE/VERSION.txt" <<EOF
+          version=${{ steps.ver.outputs.version }}
+          git_sha=${{ github.sha }}
+          target=${TARGET}
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          tar -C "$STAGE" -czf "grok-anthropic-serve-${TARGET}.tar.gz" \
+            grok-anthropic-serve VERSION.txt
+          shasum -a 256 "grok-anthropic-serve-${TARGET}.tar.gz" \
+            | tee "grok-anthropic-serve-${TARGET}.tar.gz.sha256"
+          ls -lh "grok-anthropic-serve-${TARGET}.tar.gz"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-anthropic-serve-${{ matrix.target }}
+          path: |
+            grok-anthropic-serve-${{ matrix.target }}.tar.gz
+            grok-anthropic-serve-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish GitHub release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout (install script + docs)
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: grok-anthropic-serve-*
+          merge-multiple: true
+
+      - name: Resolve tag / version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA_SHORT="${GITHUB_SHA::7}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#v}"
+            IS_ROLLING=false
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            RAW="${{ github.event.inputs.tag }}"
+            if [[ "$RAW" == v* ]]; then TAG="$RAW"; else TAG="v${RAW}"; fi
+            VER="${TAG#v}"
+            IS_ROLLING=false
+          else
+            # Rolling "latest" release updated on every main push.
+            TAG="latest"
+            VER="0.1.0+${SHA_SHORT}"
+            IS_ROLLING=true
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${VER}"
+            echo "sha_short=${SHA_SHORT}"
+            echo "is_rolling=${IS_ROLLING}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing tag=${TAG} version=${VER} rolling=${IS_ROLLING}"
+
+      - name: Assemble release files + latest.json
+        id: pack
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VER: ${{ steps.meta.outputs.version }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          shopt -s nullglob
+          tarballs=(artifacts/grok-anthropic-serve-*.tar.gz)
+          if (( ${#tarballs[@]} == 0 )); then
+            echo "error: no tarballs downloaded from build jobs" >&2
+            ls -laR artifacts || true
+            exit 1
+          fi
+          cp "${tarballs[@]}" release/
+          ls -la artifacts release
+
+          (
+            cd release
+            shasum -a 256 grok-anthropic-serve-*.tar.gz | tee SHA256SUMS
+          )
+
+          cp scripts/install-grok-anthropic-serve.sh release/install.sh
+          chmod +x release/install.sh
+
+          python3 <<'PY'
+          import datetime
+          import glob
+          import hashlib
+          import json
+          import os
+
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+          ver = os.environ["VER"]
+          sha = os.environ["GITHUB_SHA"]
+          base = f"https://github.com/{repo}/releases/download/{tag}"
+          latest_base = f"https://github.com/{repo}/releases/latest/download"
+          assets = {}
+          for path in sorted(glob.glob("release/grok-anthropic-serve-*.tar.gz")):
+              name = os.path.basename(path)
+              target = name[len("grok-anthropic-serve-") : -len(".tar.gz")]
+              with open(path, "rb") as fh:
+                  digest = hashlib.sha256(fh.read()).hexdigest()
+              assets[target] = {
+                  "name": name,
+                  "url": f"{base}/{name}",
+                  "latest_url": f"{latest_base}/{name}",
+                  "sha256": digest,
+                  "size": os.path.getsize(path),
+              }
+          doc = {
+              "name": "grok-anthropic-serve",
+              "version": ver,
+              "tag": tag,
+              "git_sha": sha,
+              "released_at": datetime.datetime.now(datetime.timezone.utc).strftime(
+                  "%Y-%m-%dT%H:%M:%SZ"
+              ),
+              "repository": f"https://github.com/{repo}",
+              "release_url": f"https://github.com/{repo}/releases/tag/{tag}",
+              "latest_release_url": f"https://github.com/{repo}/releases/latest",
+              "install_script": f"{latest_base}/install.sh",
+              "checksums_url": f"{latest_base}/SHA256SUMS",
+              "manifest_url": f"{latest_base}/latest.json",
+              "assets": assets,
+          }
+          with open("release/latest.json", "w", encoding="utf-8") as fh:
+              json.dump(doc, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(doc, indent=2))
+          PY
+
+          ls -la release
+          test -s release/latest.json
+          test -s release/SHA256SUMS
+
+      - name: Point rolling tag at this commit
+        if: steps.meta.outputs.is_rolling == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Move the lightweight `latest` tag so /releases/latest tracks HEAD.
+          git tag -f latest "${{ github.sha }}"
+          git push -f origin refs/tags/latest
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: grok-anthropic-serve ${{ steps.meta.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          # Rolling `latest` tag is not a prerelease so /releases/latest resolves to it.
+          prerelease: false
+          make_latest: true
+          generate_release_notes: ${{ steps.meta.outputs.is_rolling != 'true' }}
+          body: |
+            ## grok-anthropic-serve `${{ steps.meta.outputs.version }}`
+
+            Anthropic Messages façade for Claude Code → Grok (subscription / API key).
+
+            ### Latest URLs (for other apps)
+
+            | Asset | URL |
+            |-------|-----|
+            | Manifest | https://github.com/${{ github.repository }}/releases/latest/download/latest.json |
+            | Checksums | https://github.com/${{ github.repository }}/releases/latest/download/SHA256SUMS |
+            | Installer | https://github.com/${{ github.repository }}/releases/latest/download/install.sh |
+            | macOS arm64 | https://github.com/${{ github.repository }}/releases/latest/download/grok-anthropic-serve-aarch64-apple-darwin.tar.gz |
+            | macOS x86_64 | https://github.com/${{ github.repository }}/releases/latest/download/grok-anthropic-serve-x86_64-apple-darwin.tar.gz |
+            | Linux x86_64 | https://github.com/${{ github.repository }}/releases/latest/download/grok-anthropic-serve-x86_64-unknown-linux-gnu.tar.gz |
+            | Linux arm64 | https://github.com/${{ github.repository }}/releases/latest/download/grok-anthropic-serve-aarch64-unknown-linux-gnu.tar.gz |
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash
+            ```
+
+            git: `${{ github.sha }}`
+          files: |
+            release/grok-anthropic-serve-*.tar.gz
+            release/SHA256SUMS
+            release/latest.json
+            release/install.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
