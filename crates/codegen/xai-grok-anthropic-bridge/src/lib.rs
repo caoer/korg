@@ -32,8 +32,9 @@ pub use launcher::{
     claude_bridge_env, free_loopback_port, loopback_base_url, wait_for_healthz,
 };
 pub use port_file::{
-    PORT_FILE_ENV, PortResolution, kill_listeners_on_port, parse_port_file_contents,
-    port_file_from_env, prepare_sticky_port, read_port_file, resolve_listen_port, write_port_file,
+    DEFAULT_PORT_FILE_NAME, PORT_FILE_ENV, PortResolution, default_port_file_path,
+    kill_listeners_on_port, parse_port_file_contents, port_file_from_env, prepare_sticky_port,
+    read_port_file, resolve_listen_port, write_port_file,
 };
 pub use reasoning_signature::{
     PendingReasoning, ReasoningReplay, decode_reasoning_signature, encode_reasoning_signature,

@@ -10,15 +10,17 @@
 //! └────────────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -60,19 +62,44 @@ pub async fn run_monitor(
     result
 }
 
+/// Own the full terminal like vim / grok fullscreen: alternate screen, cleared,
+/// cursor hidden. Main scrollback is left untouched until LeaveAlternateScreen.
 fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        Clear(ClearType::All),
+        Clear(ClearType::Purge),
+        Hide,
+    )?;
+    stdout.flush()?;
     let backend = CrosstermBackend::new(stdout);
-    Ok(Terminal::new(backend)?)
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
+    install_panic_hook();
+    Ok(terminal)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // Best-effort restore even if individual steps fail.
+    // LeaveAlternateScreen restores the main scrollback; do not Clear it.
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, Show);
+    let _ = terminal.show_cursor();
     Ok(())
+}
+
+fn install_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let mut out = io::stdout();
+        let _ = execute!(out, LeaveAlternateScreen, Show);
+        let _ = out.flush();
+        original(info);
+    }));
 }
 
 struct UiState {

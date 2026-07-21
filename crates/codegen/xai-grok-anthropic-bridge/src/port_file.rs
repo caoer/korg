@@ -24,6 +24,10 @@ use std::time::Duration;
 /// tools can share the same contract.
 pub const PORT_FILE_ENV: &str = "GROK_ANTHROPIC_SERVE_PORT_FILE";
 
+/// Default sticky port file: `$GROK_HOME/anthropic-serve.port` or
+/// `~/.grok/anthropic-serve.port`.
+pub const DEFAULT_PORT_FILE_NAME: &str = "anthropic-serve.port";
+
 /// Outcome of sticky port resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortResolution {
@@ -34,11 +38,23 @@ pub struct PortResolution {
     pub path: Option<PathBuf>,
 }
 
-/// Read `GROK_ANTHROPIC_SERVE_PORT_FILE` from the environment.
-pub fn port_file_from_env() -> Option<PathBuf> {
+/// Canonical default path (`$GROK_HOME` or `~/.grok` + [`DEFAULT_PORT_FILE_NAME`]).
+pub fn default_port_file_path() -> PathBuf {
+    let home = std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".grok")))
+        .unwrap_or_else(|| PathBuf::from(".grok"));
+    home.join(DEFAULT_PORT_FILE_NAME)
+}
+
+/// Resolve sticky port file path:
+/// 1. `GROK_ANTHROPIC_SERVE_PORT_FILE` if set and non-empty
+/// 2. else [`default_port_file_path`]
+pub fn port_file_from_env() -> PathBuf {
     std::env::var_os(PORT_FILE_ENV)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
+        .unwrap_or_else(default_port_file_path)
 }
 
 /// Parse a port file's contents (trim whitespace; single decimal port).
@@ -175,12 +191,15 @@ pub fn kill_listeners_on_port(port: u16, only_ours: bool) -> Vec<u32> {
         }
         let cmd = process_command(pid);
         if only_ours && !is_our_serve_process(&cmd) {
-            eprintln!(
-                "port {port}: pid {pid} is not grok-anthropic-serve ({cmd}); not killing"
+            tracing::warn!(
+                port,
+                pid,
+                cmd = %cmd,
+                "port busy: pid is not grok-anthropic-serve; not killing"
             );
             continue;
         }
-        eprintln!("port {port}: stopping pid {pid} ({cmd})");
+        tracing::info!(port, pid, cmd = %cmd, "stopping previous listener on sticky port");
         let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
         killed.push(pid);
     }
@@ -274,5 +293,14 @@ mod tests {
         let path = dir.path().join("p");
         write_port_file(&path, 4242).unwrap();
         assert_eq!(read_port_file(&path), Some(4242));
+    }
+
+    #[test]
+    fn default_port_file_ends_with_anthropic_serve_port() {
+        let p = default_port_file_path();
+        assert_eq!(
+            p.file_name().and_then(|s| s.to_str()),
+            Some(DEFAULT_PORT_FILE_NAME)
+        );
     }
 }

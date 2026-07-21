@@ -11,6 +11,7 @@
 //!
 //! Auth: subscription session in `~/.grok/auth.json`, else API key.
 
+use std::io::IsTerminal;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -57,7 +58,8 @@ struct ServeArgs {
     #[arg(long, short = 'p')]
     port: Option<u16>,
 
-    /// Sticky port file path (overrides env `GROK_ANTHROPIC_SERVE_PORT_FILE`).
+    /// Sticky port file (default: `$HOME/.grok/anthropic-serve.port`, or
+    /// `$GROK_HOME/anthropic-serve.port` / env `GROK_ANTHROPIC_SERVE_PORT_FILE`).
     /// Contents: one decimal port. Not deleted on exit.
     #[arg(long, env = "GROK_ANTHROPIC_SERVE_PORT_FILE")]
     port_file: Option<PathBuf>,
@@ -109,7 +111,7 @@ struct ClaudeArgs {
     #[arg(long, short = 'p')]
     port: Option<u16>,
 
-    /// Sticky port file (same as serve; env `GROK_ANTHROPIC_SERVE_PORT_FILE`).
+    /// Sticky port file (default: `~/.grok/anthropic-serve.port`).
     #[arg(long, env = "GROK_ANTHROPIC_SERVE_PORT_FILE")]
     port_file: Option<PathBuf>,
 
@@ -144,15 +146,17 @@ struct ClaudeArgs {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+    // When the dual-pane TUI owns the TTY, sink all tracing so logs never
+    // corrupt the alternate screen (stdout/stderr share the same device).
+    let mute_tty_logs = match &cli.command {
+        None => will_use_tui(&cli.serve),
+        Some(Command::Serve(args)) => will_use_tui(args),
+        // Parent of the sidecar is plain logs; child is forced --no-tui.
+        Some(Command::Claude(_)) => false,
+    };
+    init_tracing(mute_tty_logs);
+
     match cli.command {
         None => run_serve_cmd(cli.serve).await,
         Some(Command::Serve(args)) => run_serve_cmd(args).await,
@@ -160,18 +164,42 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn resolve_port_file_arg(cli_path: Option<PathBuf>) -> Option<PathBuf> {
-    cli_path.or_else(port_file_from_env)
+fn will_use_tui(args: &ServeArgs) -> bool {
+    !args.no_tui && std::io::stdout().is_terminal()
+}
+
+fn init_tracing(mute_tty: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt().with_env_filter(filter);
+    if mute_tty {
+        subscriber.with_writer(std::io::sink).init();
+    } else {
+        subscriber.with_writer(std::io::stderr).init();
+    }
+}
+
+/// CLI `--port-file` wins; else env or default `~/.grok/anthropic-serve.port`.
+fn resolve_port_file_arg(cli_path: Option<PathBuf>) -> PathBuf {
+    cli_path.unwrap_or_else(port_file_from_env)
 }
 
 async fn run_serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
+    let quiet = will_use_tui(&args);
     let port_file = resolve_port_file_arg(args.port_file.clone());
-    let res = prepare_sticky_port(args.port, 18765, port_file.as_deref())
+    let res = prepare_sticky_port(args.port, 18765, Some(port_file.as_path()))
         .map_err(|e| anyhow::anyhow!("port resolve: {e}"))?;
-    if let Some(path) = &res.path {
+    if quiet {
+        tracing::info!(
+            path = %port_file.display(),
+            port = res.port,
+            env = PORT_FILE_ENV,
+            "sticky port file"
+        );
+    } else {
         eprintln!(
             "port-file: {path} → {port} ({env})",
-            path = path.display(),
+            path = port_file.display(),
             port = res.port,
             env = PORT_FILE_ENV
         );
@@ -210,19 +238,16 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
     drop(_probe);
 
     let port_file = resolve_port_file_arg(args.port_file.clone());
-    // Sidecar: sticky if port file set; else free port (default_port 0 → free).
-    let default = if port_file.is_some() { 18765 } else { 0 };
-    let res = prepare_sticky_port(args.port, default, port_file.as_deref())
+    // Sidecar always uses sticky port file (default ~/.grok/anthropic-serve.port).
+    let res = prepare_sticky_port(args.port, 18765, Some(port_file.as_path()))
         .map_err(|e| anyhow::anyhow!("port resolve: {e}"))?;
     let port = res.port;
     let base = loopback_base_url(port);
-    if let Some(path) = &res.path {
-        eprintln!(
-            "port-file: {path} → {port}",
-            path = path.display(),
-            port = port
-        );
-    }
+    eprintln!(
+        "port-file: {path} → {port}",
+        path = port_file.display(),
+        port = port
+    );
     eprintln!("sidecar: starting serve on {base}");
 
     let self_exe = std::env::current_exe()?;
@@ -244,9 +269,7 @@ async fn run_claude_sidecar(args: ClaudeArgs) -> anyhow::Result<()> {
 
     serve_cmd.arg("--no-tui");
 
-    if let Some(path) = &port_file {
-        serve_cmd.arg("--port-file").arg(path);
-    }
+    serve_cmd.arg("--port-file").arg(&port_file);
     if let Some(dir) = &args.capture_dir {
         serve_cmd.arg("--capture-dir").arg(dir);
     }

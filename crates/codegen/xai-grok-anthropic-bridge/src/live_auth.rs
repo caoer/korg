@@ -35,9 +35,10 @@ impl BridgeAuth {
                     .current_auth()
                     .map(|a| format!("{:?}", a.auth_mode))
                     .unwrap_or_else(|| "session".into());
-                eprintln!(
-                    "auth: LiveSessionAuth (OIDC refresh + proactive) home={} mode={scope}",
-                    home.display()
+                tracing::info!(
+                    home = %home.display(),
+                    mode = %scope,
+                    "auth: LiveSessionAuth (OIDC refresh + proactive)"
                 );
                 return Ok(Self::Session(live));
             }
@@ -68,16 +69,16 @@ impl BridgeAuth {
             AuthSource::Session => {
                 // Session on disk but LiveSessionAuth failed (e.g. expired RT).
                 // Use static key once — may 401 until user re-logs in.
-                eprintln!(
-                    "auth: static session key from {} (refresh unavailable: re-run grok login if 401s)",
-                    path.display()
+                tracing::info!(
+                    path = %path.display(),
+                    "auth: static session key (refresh unavailable: re-run grok login if 401s)"
                 );
                 Ok(Self::ApiKey {
                     key: resolved.bearer,
                 })
             }
             AuthSource::ApiKey => {
-                eprintln!("auth: API key (static, no OIDC refresh)");
+                tracing::info!("auth: API key (static, no OIDC refresh)");
                 Ok(Self::ApiKey {
                     key: resolved.bearer,
                 })

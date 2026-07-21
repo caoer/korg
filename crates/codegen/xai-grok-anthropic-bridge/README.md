@@ -6,14 +6,16 @@ Anthropic Messages façade so **Claude Code** can use **Grok** via the official
 ## Usage
 
 ```bash
-# Sticky port + dual-pane traffic TUI (default when stdout is a TTY):
-export GROK_ANTHROPIC_SERVE_PORT_FILE="$HOME/.grok/anthropic-serve.port"
+# Sticky port defaults to ~/.grok/anthropic-serve.port (override via env/flag).
+# Dual-pane traffic TUI on by default when stdout is a TTY (fullscreen
+# alternate screen like vim/grok; logs muted so they don't pollute the TTY):
 cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve \
   --model grok-4.5 --capture-dir /tmp/ab-capture
 # Keys: q quit · j/k request list · Tab panes · [/] scroll · g latest · w dump
-# → picks free port first time, writes it to the file; next start reuses it
-#   (kills prior grok-anthropic-serve on that port first). File is kept on exit.
-# Plain logs: add --no-tui
+# → picks free port first time, writes it; next start reuses it (kills prior
+#   grok-anthropic-serve on that port). File is kept on exit.
+# Plain logs on stderr: --no-tui
+# Custom port file: --port-file PATH  or  GROK_ANTHROPIC_SERVE_PORT_FILE=...
 
 # Long-lived serve on a fixed port:
 cargo run -p xai-grok-anthropic-bridge --bin grok-anthropic-serve -- serve \
@@ -36,10 +38,14 @@ claude
 
 | Name | Meaning |
 |------|---------|
-| **`GROK_ANTHROPIC_SERVE_PORT_FILE`** | Path to a file storing the decimal listen port (preferred name) |
+| **`GROK_ANTHROPIC_SERVE_PORT_FILE`** | Override path to the sticky port file |
 | `--port-file PATH` | Same as the env (CLI wins if both set) |
+| **Default** | `$HOME/.grok/anthropic-serve.port` (or `$GROK_HOME/anthropic-serve.port`) |
 
-Avoid `CCC_PROXY_PORT_GROK_PATH` — too CCC-specific and “path” is ambiguous. The name above matches the binary and states that the value is a **file path**, not the port itself.
+The name matches the binary and states the value is a **file path**, not the port itself.
+
+# Point Claude at the sticky port:
+export ANTHROPIC_BASE_URL="http://127.0.0.1:$(cat ~/.grok/anthropic-serve.port)"
 
 (`serve` flags also work without the subcommand for backward compatibility.)
 

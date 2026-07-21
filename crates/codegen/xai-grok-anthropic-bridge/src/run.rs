@@ -43,14 +43,12 @@ pub async fn run_serve(
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     tracing::info!(%local, "grok anthropic-serve listening");
-    eprintln!("grok anthropic-serve listening on http://{local}");
-    eprintln!("  POST /v1/messages  GET /healthz");
 
     let app = router(state);
+    // Fullscreen TUI owns the TTY; never write banners/logs to the terminal.
     let use_tui = !config.no_tui && std::io::stdout().is_terminal();
 
     if use_tui {
-        eprintln!("traffic TUI: q quit · j/k · Tab · w dump (needs --capture-dir)");
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let listen = format!("http://{local}");
         let cap = config.capture_dir.clone();
@@ -79,6 +77,8 @@ pub async fn run_serve(
             }
         }
     } else {
+        eprintln!("grok anthropic-serve listening on http://{local}");
+        eprintln!("  POST /v1/messages  GET /healthz");
         axum::serve(listener, app)
             .with_graceful_shutdown(shutdown_signal())
             .await?;
