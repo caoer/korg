@@ -81,15 +81,34 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake pkg-config protobuf-compiler \
-            libssl-dev ca-certificates curl
+            build-essential cmake pkg-config \
+            libssl-dev ca-certificates curl unzip
+          # Ubuntu jammy protoc is 3.12 — too old for this tree. Install upstream.
+          case "${{ matrix.target }}" in
+            aarch64-*) PROTOC_ZIP=protoc-28.3-linux-aarch_64.zip ;;
+            *)         PROTOC_ZIP=protoc-28.3-linux-x86_64.zip ;;
+          esac
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v28.3/${PROTOC_ZIP}"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          sudo chmod +x /usr/local/bin/protoc
+          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+          /usr/local/bin/protoc --version
 
       - name: Install macOS build deps
         if: runner.os == 'macOS'
         run: |
-          brew install cmake protobuf pkg-config || true
-          which protoc
-          protoc --version
+          brew install cmake pkg-config || true
+          case "${{ matrix.target }}" in
+            aarch64-*) PROTOC_ZIP=protoc-28.3-osx-aarch_64.zip ;;
+            *)         PROTOC_ZIP=protoc-28.3-osx-x86_64.zip ;;
+          esac
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v28.3/${PROTOC_ZIP}"
+          sudo unzip -o /tmp/protoc.zip -d /usr/local bin/protoc
+          sudo chmod +x /usr/local/bin/protoc
+          echo "PROTOC=/usr/local/bin/protoc" >> "$GITHUB_ENV"
+          /usr/local/bin/protoc --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -124,12 +143,12 @@ jobs:
       - name: Build release-dist binary
         env:
           KORG_RELEASE_VERSION: ${{ steps.ver.outputs.version }}
-          PROTOC: ${{ runner.os == 'Linux' && '/usr/bin/protoc' || '' }}
         run: |
           set -euo pipefail
           # Ensure protoc is available for tools-api build scripts.
-          command -v protoc
-          protoc --version
+          echo "PROTOC=${PROTOC:-}"
+          command -v protoc || true
+          "${PROTOC:-protoc}" --version
           cargo build \
             -p xai-grok-anthropic-bridge \
             --bin grok-anthropic-serve \
