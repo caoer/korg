@@ -27,7 +27,6 @@ curl -fsSL https://github.com/caoer/korg/releases/latest/download/install.sh | F
 | Checksums | https://github.com/caoer/korg/releases/latest/download/SHA256SUMS |
 | Installer | https://github.com/caoer/korg/releases/latest/download/install.sh |
 | macOS arm64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-aarch64-apple-darwin.tar.gz |
-| macOS x86_64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-x86_64-apple-darwin.tar.gz |
 | Linux x86_64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-x86_64-unknown-linux-gnu.tar.gz |
 | Linux arm64 | https://github.com/caoer/korg/releases/latest/download/grok-anthropic-serve-aarch64-unknown-linux-gnu.tar.gz |
 | Release page | https://github.com/caoer/korg/releases/latest |
