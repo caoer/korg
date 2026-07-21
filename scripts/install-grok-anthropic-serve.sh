@@ -5,12 +5,14 @@
 #   curl -fsSL https://github.com/caoer/korg/releases/latest/download/install.sh | bash
 #   INSTALL_DIR=~/bin ./scripts/install-grok-anthropic-serve.sh
 #   VERSION=v0.1.0 ./scripts/install-grok-anthropic-serve.sh   # pin a tag
+#   FORCE=1 ./scripts/install-grok-anthropic-serve.sh          # reinstall even if version matches
 #
 # Env:
 #   INSTALL_DIR  – install destination directory (default: ~/.local/bin)
 #   REPO         – GitHub owner/repo (default: caoer/korg)
 #   VERSION      – release tag (default: latest)
 #   BIN_NAME     – binary name (default: grok-anthropic-serve)
+#   FORCE        – set to 1 to re-download even when installed version matches
 
 set -euo pipefail
 
@@ -18,6 +20,7 @@ REPO="${REPO:-caoer/korg}"
 VERSION="${VERSION:-latest}"
 BIN_NAME="${BIN_NAME:-grok-anthropic-serve}"
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
+FORCE="${FORCE:-0}"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -63,6 +66,37 @@ else
   base="https://github.com/${REPO}/releases/download/${tag}"
 fi
 
+# Resolve the desired version string before downloading so we can skip
+# when the already-installed binary matches (saves bandwidth on reinstall).
+desired_version=""
+if [[ "${VERSION}" == "latest" ]]; then
+  if manifest="$(curl -fsSL "${base}/latest.json" 2>/dev/null)"; then
+    # Prefer python (always available on macOS; common on Linux); fall back to
+    # sed so we don't require jq.
+    if command -v python3 >/dev/null 2>&1; then
+      desired_version="$(printf '%s' "${manifest}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version",""))' 2>/dev/null || true)"
+    else
+      desired_version="$(printf '%s' "${manifest}" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    fi
+  fi
+else
+  desired_version="${VERSION#v}"
+fi
+
+installed_bin="${INSTALL_DIR}/${BIN_NAME}"
+if [[ "${FORCE}" != "1" && -x "${installed_bin}" && -n "${desired_version}" ]]; then
+  # clap --version: "grok-anthropic-serve <VERSION>"
+  current_version="$("${installed_bin}" --version 2>/dev/null | head -1 | awk '{print $NF}' || true)"
+  if [[ -n "${current_version}" && "${current_version}" == "${desired_version}" ]]; then
+    echo "Already installed: ${installed_bin} (${current_version}) — matches desired ${desired_version}, skipping download"
+    echo "  re-install: FORCE=1 $0   or   FORCE=1 curl ... | bash"
+    exit 0
+  fi
+  if [[ -n "${current_version}" ]]; then
+    echo "Upgrading ${BIN_NAME}: ${current_version} → ${desired_version:-unknown}"
+  fi
+fi
+
 url="${base}/${asset}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
@@ -87,15 +121,19 @@ tar -C "${tmpdir}" -xzf "${tmpdir}/${asset}"
 test -f "${tmpdir}/${BIN_NAME}"
 
 mkdir -p "${INSTALL_DIR}"
-install -m 0755 "${tmpdir}/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+install -m 0755 "${tmpdir}/${BIN_NAME}" "${installed_bin}"
 
+# Persist VERSION.txt next to the binary for other tools / version-skip checks.
 if [[ -f "${tmpdir}/VERSION.txt" ]]; then
+  cp "${tmpdir}/VERSION.txt" "${INSTALL_DIR}/${BIN_NAME}.VERSION.txt"
   echo "Installed metadata:"
   sed 's/^/  /' "${tmpdir}/VERSION.txt" || true
+elif [[ -n "${desired_version}" ]]; then
+  printf 'version=%s\n' "${desired_version}" > "${INSTALL_DIR}/${BIN_NAME}.VERSION.txt"
 fi
 
-echo "Installed ${INSTALL_DIR}/${BIN_NAME}"
-"${INSTALL_DIR}/${BIN_NAME}" --version 2>/dev/null || true
+echo "Installed ${installed_bin}"
+"${installed_bin}" --version 2>/dev/null || true
 
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;

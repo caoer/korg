@@ -13,6 +13,10 @@ curl -fsSL https://github.com/caoer/korg/releases/latest/download/install.sh | b
 
 # Or pin a version tag:
 curl -fsSL https://github.com/caoer/korg/releases/latest/download/install.sh | VERSION=v0.1.0 bash
+
+# Re-run is a no-op when the installed binary already matches the desired
+# version (from latest.json or VERSION=). Force a re-download with FORCE=1:
+curl -fsSL https://github.com/caoer/korg/releases/latest/download/install.sh | FORCE=1 bash
 ```
 
 ### Stable URLs for other apps
