@@ -23,12 +23,10 @@ pub fn translate_messages_request(
     default_model: &str,
     req_id: &str,
 ) -> Result<ConversationRequest, TranslateError> {
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .map(strip_context_suffix)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default_model.to_string());
+    let model = resolve_upstream_model(
+        body.get("model").and_then(Value::as_str),
+        default_model,
+    );
 
     let mut items: Vec<ConversationItem> = Vec::new();
 
@@ -98,6 +96,37 @@ fn strip_context_suffix(model: &str) -> String {
         .map(|(m, _)| m)
         .unwrap_or(model)
         .to_string()
+}
+
+/// Map Claude Code model ids onto a Grok model the cli-chat-proxy accepts.
+///
+/// Claude Code (especially Agent/subagent and "small fast" paths) still sends
+/// Anthropic ids like `claude-sonnet-5` / `claude-haiku-4-5-…` even when
+/// `ANTHROPIC_MODEL=grok-4.5`. Forwarding those upstream yields:
+///   - 400 `invalid request body: missing field \`messages\`` for unknown models
+///   - 404 `not-found` for haiku-style ids
+/// So any non-Grok model is rewritten to the serve `--model` default.
+fn resolve_upstream_model(requested: Option<&str>, default_model: &str) -> String {
+    let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) else {
+        return default_model.to_string();
+    };
+    let model = strip_context_suffix(raw);
+    if is_grok_model(&model) {
+        return model;
+    }
+    tracing::debug!(
+        requested = %raw,
+        mapped = %default_model,
+        "rewriting non-grok model id to bridge default"
+    );
+    default_model.to_string()
+}
+
+fn is_grok_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.starts_with("grok")
+        || lower.starts_with("xai-")
+        || lower.contains("grok-")
 }
 
 fn system_to_text(system: &Value) -> Result<Option<String>, TranslateError> {
@@ -423,6 +452,28 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_claude_model_ids_to_default() {
+        assert_eq!(
+            resolve_upstream_model(Some("claude-sonnet-5"), "grok-4.5"),
+            "grok-4.5"
+        );
+        assert_eq!(
+            resolve_upstream_model(Some("claude-haiku-4-5-20251001"), "grok-4.5"),
+            "grok-4.5"
+        );
+        assert_eq!(
+            resolve_upstream_model(Some("claude-opus-5[1m]"), "grok-4.5"),
+            "grok-4.5"
+        );
+        // Grok ids pass through (including compaction suffix strip).
+        assert_eq!(
+            resolve_upstream_model(Some("grok-4.5[1m]"), "grok-3"),
+            "grok-4.5"
+        );
+        assert_eq!(resolve_upstream_model(None, "grok-4.5"), "grok-4.5");
+    }
+
+    #[test]
     fn maps_simple_user_message() {
         let body = json!({
             "model": "grok-4.5",
@@ -440,6 +491,25 @@ mod tests {
         let req = translate_messages_request(&body, &epoch, "grok-4.5", "r1").unwrap();
         assert_eq!(req.model.as_deref(), Some("grok-4.5"));
         assert_eq!(req.items.len(), 1);
+    }
+
+    #[test]
+    fn translate_rewrites_subagent_claude_model() {
+        let body = json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "extract"}]
+        });
+        let epoch = crate::SessionEpoch {
+            claude_session_id: "s".into(),
+            grok_session_id: "s".into(),
+            conv_id: "c".into(),
+            turn: 1,
+            tools_hash: None,
+            epoch: 0,
+        };
+        let req = translate_messages_request(&body, &epoch, "grok-4.5", "r1").unwrap();
+        assert_eq!(req.model.as_deref(), Some("grok-4.5"));
     }
 
     #[test]

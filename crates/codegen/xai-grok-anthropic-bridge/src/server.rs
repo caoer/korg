@@ -294,30 +294,31 @@ async fn stream_messages_response(
     let (tx, rx) = mpsc::channel::<Result<String, String>>(64);
 
     tokio::spawn(async move {
-        let send = |s: String| {
+        let send_frame = |tx: &mpsc::Sender<Result<String, String>>, frame: String| {
             let tx = tx.clone();
-            async move {
-                let _ = tx.send(Ok(s)).await;
-            }
+            async move { tx.send(Ok(frame)).await.is_ok() }
         };
 
-        send(sse::message_start(&message_id, &model)).await;
-
+        // Open upstream before message_start so open failures become a clean
+        // `event: error` (Claude Code throws) instead of a half-started stream
+        // that ends with zero content → "Stream ended without receiving any events".
         let stream_result = open_conversation_stream(&state, request).await;
         let (mut stream, _meta, _doom) = match stream_result {
             Ok(s) => s,
             Err(e) => {
-                let _ = tx
-                    .send(Ok(sse::encode_out(&AnthropicOut::Error {
-                        message: e.to_string(),
-                    })[0]
-                        .clone()))
-                    .await;
+                let _ = send_frame(&tx, sse::error_event(e.to_string())).await;
                 return;
             }
         };
 
+        if !send_frame(&tx, sse::message_start(&message_id, &model)).await {
+            return;
+        }
+
         let mut reducer = StreamReducer::new();
+        // When set, stop reducing and emit a single terminal `event: error`.
+        let mut fatal_error: Option<String> = None;
+
         while let Some(ev) = stream.next().await {
             match ev {
                 Ok(event) => {
@@ -328,6 +329,12 @@ async fn stream_messages_response(
                         json!({"type": event_type_name(&event)}),
                     );
                     for out in reducer.push_event(&event) {
+                        if let AnthropicOut::Error { message } = &out {
+                            // Do not emit here — send once after the loop so we
+                            // never mix a partial finish with a duplicate error.
+                            fatal_error = Some(message.clone());
+                            break;
+                        }
                         state.traffic.record_json(
                             &req_id,
                             TrafficSide::Claude,
@@ -335,19 +342,39 @@ async fn stream_messages_response(
                             anthropic_out_debug(&out),
                         );
                         for frame in sse::encode_out(&out) {
-                            if tx.send(Ok(frame)).await.is_err() {
+                            if !send_frame(&tx, frame).await {
                                 return;
                             }
                         }
                     }
+                    if fatal_error.is_some() {
+                        break;
+                    }
                 }
                 Err(e) => {
-                    let frames = sse::encode_out(&AnthropicOut::Error {
-                        message: e.to_string(),
-                    });
-                    for frame in frames {
-                        let _ = tx.send(Ok(frame)).await;
-                    }
+                    fatal_error = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+
+        if let Some(message) = fatal_error {
+            // Claude Code's SDK only surfaces APIError for `event: error`.
+            let _ = send_frame(&tx, sse::error_event(message)).await;
+            return;
+        }
+
+        // Upstream closed without response.completed / incomplete — still close
+        // the Anthropic SSE lifecycle so Claude Code does not treat it as empty.
+        for out in reducer.finish_if_needed() {
+            state.traffic.record_json(
+                &req_id,
+                TrafficSide::Claude,
+                "out",
+                anthropic_out_debug(&out),
+            );
+            for frame in sse::encode_out(&out) {
+                if !send_frame(&tx, frame).await {
                     return;
                 }
             }
@@ -360,10 +387,7 @@ async fn stream_messages_response(
             match item {
                 Ok(s) => yield Ok::<_, std::io::Error>(bytes::Bytes::from(s)),
                 Err(e) => {
-                    let frames = sse::encode_out(&AnthropicOut::Error { message: e });
-                    if let Some(frame) = frames.into_iter().next() {
-                        yield Ok(bytes::Bytes::from(frame));
-                    }
+                    yield Ok(bytes::Bytes::from(sse::error_event(e)));
                 }
             }
         }

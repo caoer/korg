@@ -44,6 +44,8 @@ pub struct StreamReducer {
     output_to_tool: std::collections::HashMap<u32, usize>,
     pending_reasoning: PendingReasoning,
     saw_tool: bool,
+    /// True once we have emitted MessageStop (completed/incomplete/forced finish).
+    finished: bool,
 }
 
 impl StreamReducer {
@@ -198,6 +200,13 @@ impl StreamReducer {
                     fc.call_id.clone()
                 };
                 if let Some((idx, _)) = self.tools.get(&key).cloned() {
+                    // Drop every alias of this tool (call_id and item id both
+                    // map to idx) so the end-of-stream drain cannot close the
+                    // block again: a repeated content_block_stop makes Claude
+                    // Code materialize a duplicate tool_use block and execute
+                    // the call once per copy.
+                    self.tools.retain(|_, (i, _)| *i != idx);
+                    self.output_to_tool.retain(|_, i| *i != idx);
                     out.push(AnthropicOut::ToolUseStop { index: idx });
                 }
                 out
@@ -252,8 +261,24 @@ impl StreamReducer {
         if let Some(idx) = self.active_text.take() {
             out.push(AnthropicOut::TextStop { index: idx });
         }
-        for (_k, (idx, _)) in self.tools.drain() {
+        // A tool is registered under both its call_id and its item id, so
+        // dedupe by block index — one content_block_stop per open block.
+        let mut open: Vec<usize> = self.tools.drain().map(|(_k, (idx, _))| idx).collect();
+        open.sort_unstable();
+        open.dedup();
+        for idx in open {
             out.push(AnthropicOut::ToolUseStop { index: idx });
+        }
+
+        // Claude Code rejects streams that never complete a content block
+        // ("Stream ended without receiving any events" / tengu_stream_no_events)
+        // unless message_delta carries a stop_reason. Prefer a real block when
+        // we had one; otherwise emit an empty text block so the lifecycle is valid.
+        let had_content = self.next_index > 0 || self.saw_tool;
+        if !had_content {
+            let idx = self.alloc();
+            out.push(AnthropicOut::TextStart { index: idx });
+            out.push(AnthropicOut::TextStop { index: idx });
         }
 
         let (input_tokens, output_tokens) = response
@@ -273,7 +298,24 @@ impl StreamReducer {
             output_tokens,
         });
         out.push(AnthropicOut::MessageStop);
+        self.finished = true;
         out
+    }
+
+    /// Close the Anthropic stream if upstream ended without `response.completed`.
+    ///
+    /// Returns empty if we already emitted `message_stop` (via completed/incomplete).
+    pub fn finish_if_needed(&mut self) -> Vec<AnthropicOut> {
+        if self.finished {
+            return vec![];
+        }
+        self.finish_open_blocks(None)
+    }
+
+    /// Whether `message_stop` has already been emitted.
+    #[cfg(test)]
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
 
     fn alloc(&mut self) -> usize {
@@ -316,5 +358,93 @@ pub fn anthropic_out_debug(ev: &AnthropicOut) -> Value {
         AnthropicOut::MessageStop => json!({"type": "message_stop"}),
         AnthropicOut::Error { message } => json!({"type": "error", "message": message}),
         other => json!({"type": format!("{other:?}").chars().take(40).collect::<String>()}),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn function_call_item() -> rs::OutputItem {
+        rs::OutputItem::FunctionCall(rs::FunctionToolCall {
+            arguments: "{\"text\":\"banana\"}".into(),
+            call_id: "call-1".into(),
+            name: "echo_tool".into(),
+            id: Some("fc_item_1".into()),
+            status: None,
+        })
+    }
+
+    fn count_tool_stops(events: &[AnthropicOut]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, AnthropicOut::ToolUseStop { .. }))
+            .count()
+    }
+
+    /// One tool call must close its content block exactly once. A repeated
+    /// content_block_stop makes Claude Code materialize a duplicate tool_use
+    /// block — and execute the call once per copy (observed 3x: one stop from
+    /// output_item.done plus one per alias key from the end-of-stream drain).
+    #[test]
+    fn tool_use_stop_emitted_exactly_once_when_item_done() {
+        let mut r = StreamReducer::new();
+        let mut stops = 0;
+        stops += count_tool_stops(&r.push_event(
+            &ResponseStreamEvent::ResponseOutputItemAdded(rs::ResponseOutputItemAddedEvent {
+                sequence_number: 1,
+                output_index: 0,
+                item: function_call_item(),
+            }),
+        ));
+        stops += count_tool_stops(&r.push_event(
+            &ResponseStreamEvent::ResponseOutputItemDone(rs::ResponseOutputItemDoneEvent {
+                sequence_number: 2,
+                output_index: 0,
+                item: function_call_item(),
+            }),
+        ));
+        let tail = r.finish_if_needed();
+        stops += count_tool_stops(&tail);
+        assert_eq!(stops, 1, "tool block closed more than once");
+        assert!(matches!(tail.last(), Some(AnthropicOut::MessageStop)));
+    }
+
+    /// A tool left open at end of stream is closed by the drain — once, even
+    /// though it is registered under both call_id and item id.
+    #[test]
+    fn unclosed_tool_drain_dedupes_alias_keys() {
+        let mut r = StreamReducer::new();
+        r.push_event(&ResponseStreamEvent::ResponseOutputItemAdded(
+            rs::ResponseOutputItemAddedEvent {
+                sequence_number: 1,
+                output_index: 0,
+                item: function_call_item(),
+            },
+        ));
+        assert_eq!(count_tool_stops(&r.finish_if_needed()), 1);
+    }
+
+    #[test]
+    fn finish_if_needed_emits_empty_text_and_stop_on_blank_stream() {
+        let mut r = StreamReducer::new();
+        let out = r.finish_if_needed();
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, AnthropicOut::TextStart { .. })),
+            "empty upstream must still open a content block: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, AnthropicOut::TextStop { .. }))
+        );
+        assert!(matches!(out.last(), Some(AnthropicOut::MessageStop)));
+        let stop = out.iter().find_map(|e| match e {
+            AnthropicOut::MessageDelta { stop_reason, .. } => stop_reason.clone(),
+            _ => None,
+        });
+        assert_eq!(stop.as_deref(), Some("end_turn"));
+        assert!(r.is_finished());
+        assert!(r.finish_if_needed().is_empty(), "idempotent");
     }
 }
