@@ -111,6 +111,33 @@ Use Ctrl+V for screenshots, browser \"Copy Image\", and file-manager image \
 copies.\n\
 You can also drag an image file into the prompt.";
 
+// Undo/redo are textarea chords, not ActionRegistry entries. Super/Cmd also
+// works where the terminal delivers it; list Ctrl only (hosts often swallow Super).
+const UNDO_LONG_HELP: &str = "\
+Undoes the last change in the prompt editor.\n\
+Covers typing, deletes, line/word kills, and clearing a draft.";
+
+const REDO_LONG_HELP: &str = "\
+Redoes the last undone change in the prompt editor.\n\
+Ctrl+Shift+Z is primary; Ctrl+R is an alternate.";
+
+// Prompt history is not an ActionRegistry entry: Up is an inline key handler and
+// /history is a slash command. Surface both here for discoverability.
+const HISTORY_LONG_HELP: &str = "\
+Recalls previously sent prompts.\n\
+Press Up on an empty prompt to browse earlier prompts, newest first; each move \
+live-populates the composer so you can edit and resend.\n\
+Run /history to open a searchable history panel and filter by text.";
+
+// Scrollback search has no ActionRegistry entry: it's the vim `/` inline handler,
+// or the /find slash command in simple mode. Surface both triggers here.
+const SCROLLBACK_SEARCH_LONG_HELP: &str = "\
+Searches the conversation scrollback for text and jumps between matches.\n\
+In the prompt input, run /find to search. In vim mode, you can also press / \
+while the scrollback is focused.\n\
+Type a query, then use n and N (or the arrow keys) to step through matches. \
+Press Enter to jump to a match and Esc to dismiss.";
+
 /// Build the entries vector for the modal, grouped by category.
 ///
 /// All registered actions are included, grouped by category. Actions
@@ -168,12 +195,14 @@ pub fn build_entries(
                 continue;
             }
             // The voice chord (`Ctrl+Space`) is hidden when the voice gate is
-            // off (remote kill switch / `GROK_VOICE_MODE=0`). Unlike the old
-            // `Ctrl+Shift+M`, `Ctrl+Space` decodes the same with or without the
-            // Kitty keyboard protocol (it just toggles instead of hold-to-talk
-            // without it), so it's shown on every terminal once the gate is on.
+            // off (remote kill switch / `GROK_VOICE_MODE=0`) or the user turned
+            // the Voice shortcut setting off — don't advertise keys that do
+            // nothing. `Ctrl+Space` decodes the same with or without the Kitty
+            // keyboard protocol (it just toggles instead of hold-to-talk), so
+            // it's shown on every terminal once the gates are on.
             // EnableVoiceMode is slash-only and already dropped above.
-            if def.id == crate::actions::ActionId::VoiceToggle && !crate::app::voice_mode_enabled()
+            if def.id == crate::actions::ActionId::VoiceToggle
+                && (!crate::app::voice_mode_enabled() || !crate::app::voice_keybind_enabled())
             {
                 continue;
             }
@@ -261,24 +290,71 @@ pub fn build_entries(
                 item,
                 dimmed,
                 action_id: None,
-                long_help: None,
+                long_help: Some(SCROLLBACK_SEARCH_LONG_HELP),
             });
         }
-        // Paste is handled by `is_paste_key`, not the registry. Ctrl+V always;
-        // Windows also Alt+V as a fallback. Super/Cmd omitted — many terminals
-        // swallow it. Lit on the agent prompt and the dashboard (both paste).
-        if cat == Category::Input {
-            let mut item = HintItem::new(crate::key!('v', CONTROL), "paste");
-            item.description = Some("Paste images (and text) from the clipboard".into());
-            #[cfg(target_os = "windows")]
-            item.keys.push(crate::key!('v', ALT));
-            let dimmed = !active_contexts.contains(&When::PromptFocused)
-                && !active_contexts.contains(&When::DashboardFocused);
+        // Simple mode reaches scrollback search via the `/find` slash command,
+        // not a keystroke: use a null key + custom display so the raw key list
+        // stays empty of `/`.
+        if !vim_mode && cat == Category::ConversationNav {
+            let mut item = HintItem::new(crate::key!(Null), "search");
+            item.custom_display = Some("/find");
+            item.description = Some("Search scrollback".into());
+            // `/find` is a slash command typed at the prompt (not a scrollback
+            // keystroke like the vim `/` above), so it is available when the
+            // prompt is focused — dim on `!PromptFocused`, not scrollback.
+            let dimmed = !active_contexts.contains(&When::PromptFocused);
             entries.push(ShortcutsHelpEntry::Hint {
                 item,
                 dimmed,
                 action_id: None,
-                long_help: Some(PASTE_LONG_HELP),
+                long_help: Some(SCROLLBACK_SEARCH_LONG_HELP),
+            });
+        }
+        // Clipboard + textarea chords not in ActionRegistry. Super/Cmd omitted
+        // (often swallowed). Lit on agent prompt and dashboard reply hosts.
+        if cat == Category::Input {
+            let dimmed = !active_contexts.contains(&When::PromptFocused)
+                && !active_contexts.contains(&When::DashboardFocused);
+            let push_pseudo = |entries: &mut Vec<ShortcutsHelpEntry>,
+                               item: HintItem,
+                               long_help: Option<&'static str>| {
+                entries.push(ShortcutsHelpEntry::Hint {
+                    item,
+                    dimmed,
+                    action_id: None,
+                    long_help,
+                });
+            };
+
+            let mut paste = HintItem::new(crate::key!('v', CONTROL), "paste");
+            paste.description = Some("Paste images (and text) from the clipboard".into());
+            #[cfg(target_os = "windows")]
+            paste.keys.push(crate::key!('v', ALT));
+            push_pseudo(&mut entries, paste, Some(PASTE_LONG_HELP));
+
+            let mut undo = HintItem::new(crate::key!('z', CONTROL), "undo");
+            undo.description = Some("Undo the last prompt edit".into());
+            push_pseudo(&mut entries, undo, Some(UNDO_LONG_HELP));
+
+            // Textarea: Ctrl+Shift+Z (+ Ctrl+R alt). Ctrl+R is prompt-only;
+            // scrollback may bind it to mouse reporting when that toggle is on.
+            let mut redo = HintItem::new(crate::key!('z', CONTROL | SHIFT), "redo");
+            redo.description = Some("Redo the last undone prompt edit".into());
+            redo.keys.push(crate::key!('r', CONTROL));
+            push_pseudo(&mut entries, redo, Some(REDO_LONG_HELP));
+
+            // Prompt history (Up / /history). Not part of the shared paste/undo/redo
+            // `dimmed`: that also lights on DashboardFocused, but Up-history is
+            // prompt-only, so give it its own PromptFocused-scoped dim.
+            let mut history = HintItem::new(crate::key!(Up), "history");
+            history.description = Some("Prompt history".into());
+            let history_dimmed = !active_contexts.contains(&When::PromptFocused);
+            entries.push(ShortcutsHelpEntry::Hint {
+                item: history,
+                dimmed: history_dimmed,
+                action_id: None,
+                long_help: Some(HISTORY_LONG_HELP),
             });
         }
         let count = entries.len() - header_idx - 1;
@@ -468,6 +544,7 @@ fn picker_config(non_sel: &[bool]) -> PickerConfig<'_> {
         filter_label: None,
         filter_key_hint: None,
         filter_active: false,
+        header_note: None,
         action_keys: &[],
         disable_search: false,
         compact_bottom_bar: false,
@@ -527,7 +604,7 @@ impl ShortcutsHelpMode {
 /// Build detail mode state from a cheatsheet entry (title/keys/body for the man page).
 ///
 /// Registry rows always open. Pseudo-rows (`action_id: None`) open only when they
-/// ship `long_help` so list-only rows like scrollback search stay browse-only.
+/// ship `long_help`; one without it stays list-only (browse-only).
 pub fn detail_from_entry(entry: &ShortcutsHelpEntry) -> Option<ShortcutsHelpMode> {
     let ShortcutsHelpEntry::Hint {
         item,
@@ -1324,6 +1401,7 @@ pub fn render_modal(
         &[],
         Some(theme.bg_base),
         false,
+        0,
         inner_x + inner_width - 1,
     );
     state.hit_areas = Some(PickerHitAreas {
@@ -1770,6 +1848,71 @@ mod tests {
     }
 
     #[test]
+    fn build_entries_show_mode_correct_ctrl_g_and_shared_ctrl_b() {
+        for mode in [
+            crate::app::ScreenMode::Fullscreen,
+            crate::app::ScreenMode::Inline,
+            crate::app::ScreenMode::Minimal,
+        ] {
+            let registry = ActionRegistry::defaults_for(mode);
+            let prompt_contexts = [When::PromptFocused, When::AgentScreen, When::Always];
+            let entries = build_entries(&prompt_contexts, &registry, true);
+
+            let row = |action: ActionId| {
+                entries.iter().find_map(|entry| match entry {
+                    ShortcutsHelpEntry::Hint {
+                        item,
+                        action_id: Some(id),
+                        ..
+                    } if *id == action => Some(item),
+                    _ => None,
+                })
+            };
+            let background = row(ActionId::SendToBackground).expect("background row");
+            assert_eq!(background.keys, vec![crate::key!('b', CONTROL)]);
+
+            let agent_ctrl_g_rows: Vec<_> = entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    ShortcutsHelpEntry::Hint {
+                        item,
+                        action_id: Some(id),
+                        ..
+                    } if item.keys.contains(&crate::key!('g', CONTROL))
+                        && registry
+                            .find(*id)
+                            .is_some_and(|def| def.context == When::AgentScreen) =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .collect();
+            if mode.is_minimal() {
+                assert!(row(ActionId::FocusScrollback).is_none());
+            } else {
+                assert!(row(ActionId::FocusScrollback).is_some());
+            }
+
+            let expected = if mode.is_minimal() {
+                ActionId::EditPromptExternal
+            } else {
+                ActionId::ToggleTasks
+            };
+            assert_eq!(agent_ctrl_g_rows, vec![expected]);
+            assert!(row(expected).is_some());
+            assert!(
+                row(if mode.is_minimal() {
+                    ActionId::ToggleTasks
+                } else {
+                    ActionId::EditPromptExternal
+                })
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
     fn build_entries_includes_new_pane_actions() {
         let registry = ActionRegistry::defaults();
         let entries = build_entries(&all_contexts(), &registry, true);
@@ -1807,6 +1950,26 @@ mod tests {
         })
     }
 
+    fn has_find_search(entries: &[ShortcutsHelpEntry]) -> bool {
+        entries.iter().any(|e| {
+            matches!(
+                e,
+                ShortcutsHelpEntry::Hint { item, .. }
+                    if item.custom_display == Some("/find")
+            )
+        })
+    }
+
+    fn history_row(entries: &[ShortcutsHelpEntry]) -> Option<&ShortcutsHelpEntry> {
+        entries.iter().find(|e| {
+            matches!(
+                e,
+                ShortcutsHelpEntry::Hint { item, action_id: None, .. }
+                    if item.label == "history"
+            )
+        })
+    }
+
     #[test]
     fn build_entries_includes_scrollback_search_in_vim_mode() {
         let registry = ActionRegistry::defaults();
@@ -1815,15 +1978,71 @@ mod tests {
             has_scrollback_search(&entries),
             "vim cheatsheet should list / search"
         );
+        assert!(
+            !has_find_search(&entries),
+            "vim mode uses the `/` key row, not the /find slash row"
+        );
     }
 
     #[test]
-    fn build_entries_omits_scrollback_search_in_simple_mode() {
+    fn build_entries_includes_find_search_in_simple_mode() {
         let registry = ActionRegistry::defaults();
         let entries = build_entries(&all_contexts(), &registry, false);
         assert!(
+            has_find_search(&entries),
+            "simple mode should list the /find scrollback search"
+        );
+        assert!(
             !has_scrollback_search(&entries),
-            "simple mode does not bind / to search, so it must not be listed"
+            "simple mode must not list the bare `/` key row"
+        );
+    }
+
+    #[test]
+    fn build_entries_includes_history_row_in_both_modes() {
+        let registry = ActionRegistry::defaults();
+        for vim in [true, false] {
+            let entries = build_entries(&all_contexts(), &registry, vim);
+            assert!(
+                history_row(&entries).is_some(),
+                "history row should appear in vim={vim} mode"
+            );
+        }
+    }
+
+    #[test]
+    fn history_row_lit_only_by_prompt_focus() {
+        let registry = ActionRegistry::defaults();
+
+        let entries = build_entries(&[When::PromptFocused], &registry, false);
+        let ShortcutsHelpEntry::Hint { dimmed, .. } =
+            history_row(&entries).expect("history row present")
+        else {
+            unreachable!();
+        };
+        assert!(
+            !*dimmed,
+            "history row must be lit when the prompt is focused"
+        );
+
+        let entries = build_entries(&[When::ScrollbackFocused], &registry, false);
+        let ShortcutsHelpEntry::Hint { dimmed, .. } =
+            history_row(&entries).expect("history row present")
+        else {
+            unreachable!();
+        };
+        assert!(*dimmed, "history row must be dimmed without prompt focus");
+
+        // Dashboard focus alone must not light it (unlike paste/undo/redo).
+        let entries = build_entries(&[When::DashboardFocused], &registry, false);
+        let ShortcutsHelpEntry::Hint { dimmed, .. } =
+            history_row(&entries).expect("history row present")
+        else {
+            unreachable!();
+        };
+        assert!(
+            *dimmed,
+            "dashboard focus alone must not light the history row"
         );
     }
 
@@ -1868,50 +2087,87 @@ mod tests {
         assert!(!item.keys.iter().any(|k| *k == key!('v', ALT)));
     }
 
-    fn paste_is_dimmed(entries: &[ShortcutsHelpEntry]) -> Option<bool> {
+    /// Display-only Input rows for textarea undo/redo (mirrors paste).
+    #[test]
+    fn build_entries_lists_undo_and_redo() {
+        let registry = ActionRegistry::defaults();
+        let entries = build_entries(&all_contexts(), &registry, true);
+
+        let (undo_keys, undo_help) = pseudo_hint(&entries, "undo").expect("undo row");
+        assert!(undo_keys.contains(&key!('z', CONTROL)));
+        assert_eq!(undo_help, Some(UNDO_LONG_HELP));
+
+        let (redo_keys, redo_help) = pseudo_hint(&entries, "redo").expect("redo row");
+        assert!(redo_keys.contains(&key!('z', CONTROL | SHIFT)));
+        assert!(redo_keys.contains(&key!('r', CONTROL)));
+        assert_eq!(redo_help, Some(REDO_LONG_HELP));
+    }
+
+    fn pseudo_hint<'a>(
+        entries: &'a [ShortcutsHelpEntry],
+        label: &str,
+    ) -> Option<(&'a [KeyShortcut], Option<&'static str>)> {
+        entries.iter().find_map(|e| match e {
+            ShortcutsHelpEntry::Hint {
+                item,
+                action_id: None,
+                long_help,
+                ..
+            } if item.label == label => Some((item.keys.as_slice(), *long_help)),
+            _ => None,
+        })
+    }
+
+    fn pseudo_dimmed(entries: &[ShortcutsHelpEntry], label: &str) -> Option<bool> {
         entries.iter().find_map(|e| match e {
             ShortcutsHelpEntry::Hint {
                 item,
                 dimmed,
                 action_id: None,
                 ..
-            } if item.label == "paste" => Some(*dimmed),
+            } if item.label == label => Some(*dimmed),
             _ => None,
         })
     }
 
     #[test]
-    fn build_entries_dims_paste_outside_prompt_and_dashboard() {
+    fn build_entries_dims_editor_pseudo_rows_outside_prompt_and_dashboard() {
         let registry = ActionRegistry::defaults();
-        assert_eq!(
-            paste_is_dimmed(&build_entries(
-                &[When::ScrollbackFocused, When::AgentScreen, When::Always],
-                &registry,
-                true,
-            )),
-            Some(true),
-            "paste dimmed when neither prompt nor dashboard is active"
-        );
-        assert_eq!(
-            paste_is_dimmed(&build_entries(
-                &[When::PromptFocused, When::AgentScreen, When::Always],
-                &registry,
-                true,
-            )),
-            Some(false),
-            "paste lit when prompt is focused"
-        );
-        // Dashboard host opens the cheatsheet with only DashboardFocused + Always
-        // and handles paste itself — must not dim a working shortcut.
-        assert_eq!(
-            paste_is_dimmed(&build_entries(
-                &[When::DashboardFocused, When::Always],
-                &registry,
-                true,
-            )),
-            Some(false),
-            "paste lit on the dashboard host"
-        );
+        // paste / undo / redo share the same host lit/dim policy.
+        for label in ["paste", "undo", "redo"] {
+            assert_eq!(
+                pseudo_dimmed(
+                    &build_entries(
+                        &[When::ScrollbackFocused, When::AgentScreen, When::Always],
+                        &registry,
+                        true,
+                    ),
+                    label,
+                ),
+                Some(true),
+                "{label} dimmed off prompt/dashboard"
+            );
+            assert_eq!(
+                pseudo_dimmed(
+                    &build_entries(
+                        &[When::PromptFocused, When::AgentScreen, When::Always],
+                        &registry,
+                        true,
+                    ),
+                    label,
+                ),
+                Some(false),
+                "{label} lit when prompt focused"
+            );
+            assert_eq!(
+                pseudo_dimmed(
+                    &build_entries(&[When::DashboardFocused, When::Always], &registry, true),
+                    label,
+                ),
+                Some(false),
+                "{label} lit on dashboard host"
+            );
+        }
     }
 
     #[test]
@@ -2038,16 +2294,27 @@ mod tests {
     fn build_entries_overlay_stop_wins_dedup_and_shadows_cheatsheet_ctrl_x() {
         let registry = ActionRegistry::defaults();
         let ctrl_x = crate::key!('x', CONTROL);
+        // Match the two Ctrl+X rows by ActionId: the list and overlay
+        // stops carry different labels ("delete" vs "stop").
+        let is_stop = |action_id: &Option<ActionId>| {
+            matches!(
+                action_id,
+                Some(ActionId::DashboardStop | ActionId::DashboardOverlayStop)
+            )
+        };
         let stop_rows = |entries: &[ShortcutsHelpEntry]| -> Vec<(String, bool)> {
             entries
                 .iter()
                 .filter_map(|e| match e {
-                    ShortcutsHelpEntry::Hint { item, dimmed, .. } if item.label == "stop" => {
-                        Some((
-                            item.description.as_deref().unwrap_or_default().to_string(),
-                            *dimmed,
-                        ))
-                    }
+                    ShortcutsHelpEntry::Hint {
+                        item,
+                        dimmed,
+                        action_id,
+                        ..
+                    } if is_stop(action_id) => Some((
+                        item.description.as_deref().unwrap_or_default().to_string(),
+                        *dimmed,
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -2056,9 +2323,9 @@ mod tests {
             entries
                 .iter()
                 .find_map(|e| match e {
-                    ShortcutsHelpEntry::Hint {
-                        item, action_id, ..
-                    } if item.label == "stop" => Some(*action_id),
+                    ShortcutsHelpEntry::Hint { action_id, .. } if is_stop(action_id) => {
+                        Some(*action_id)
+                    }
                     _ => None,
                 })
                 .flatten()
@@ -2080,8 +2347,7 @@ mod tests {
         let list = build_entries(&[When::DashboardFocused, When::Always], &registry, true);
         assert_eq!(
             stop_rows(&list),
-            vec![("Stop / Close agent".to_string(), false)],
-            "the dashboard list must show exactly the list `stop`, lit",
+            vec![("Stop / Delete agent".to_string(), false)],
         );
         assert_eq!(
             stop_id(&list),
@@ -2597,7 +2863,7 @@ mod tests {
 
     /// Search has no long_help — Enter stays in browse.
     #[test]
-    fn enter_on_search_pseudo_row_does_not_open_detail() {
+    fn enter_on_search_pseudo_row_opens_detail() {
         let registry = ActionRegistry::defaults();
         let entries = build_entries(&all_contexts(), &registry, true);
         let idx = entries
@@ -2605,11 +2871,24 @@ mod tests {
             .position(|e| {
                 matches!(
                     e,
-                    ShortcutsHelpEntry::Hint { item, action_id: None, .. }
-                        if item.label == "search"
+                    ShortcutsHelpEntry::Hint {
+                        item,
+                        action_id: None,
+                        long_help: Some(_),
+                        ..
+                    } if item.label == "search"
                 )
             })
             .expect("vim-mode entries include the `/`-search pseudo-row");
+        assert_eq!(
+            detail_from_entry(&entries[idx])
+                .and_then(|m| match m {
+                    ShortcutsHelpMode::Detail { body, .. } => Some(body),
+                    _ => None,
+                })
+                .as_deref(),
+            Some(SCROLLBACK_SEARCH_LONG_HELP)
+        );
         let mut state = build_initial_picker_state(&entries);
         state.selected = idx;
         let mut mode = browse_mode();
@@ -2622,14 +2901,10 @@ mod tests {
             &no_expanded(),
             &mut mode,
         );
-        assert_eq!(out, ShortcutsHelpOutcome::Unchanged);
-        assert!(
-            mode.is_browse(),
-            "search pseudo-row Enter must not open detail"
-        );
+        assert_eq!(out, ShortcutsHelpOutcome::Changed);
+        assert!(mode.is_detail(), "search pseudo-row Enter opens detail");
     }
 
-    /// Paste ships long_help — Enter opens the man-page detail view.
     #[test]
     fn enter_on_paste_pseudo_row_opens_detail() {
         let registry = ActionRegistry::defaults();
@@ -3137,9 +3412,14 @@ mod tests {
             "registry-backed hints must carry their ActionId for expand/detail"
         );
 
-        // Registry rows carry ActionId; search + paste are display-only.
+        // Registry rows carry ActionId; known display-only rows stay action-less.
         let search_key = key!('/');
         let paste_key = key!('v', CONTROL);
+        let undo_key = key!('z', CONTROL);
+        let redo_key = key!('z', CONTROL | SHIFT);
+        // Prompt history (Up / /history) is an inline key handler + slash
+        // command, not an ActionRegistry entry, so it stays display-only too.
+        let history_key = key!(Up);
         for entry in &entries {
             let ShortcutsHelpEntry::Hint {
                 item, action_id, ..
@@ -3147,8 +3427,14 @@ mod tests {
             else {
                 continue;
             };
-            let is_pseudo = (item.label == "search" && item.keys.contains(&search_key))
-                || (item.label == "paste" && item.keys.contains(&paste_key));
+            let is_pseudo = match item.label.as_ref() {
+                "search" => item.keys.contains(&search_key),
+                "paste" => item.keys.contains(&paste_key),
+                "undo" => item.keys.contains(&undo_key),
+                "redo" => item.keys.contains(&redo_key),
+                "history" => item.keys.contains(&history_key),
+                _ => false,
+            };
             if is_pseudo {
                 assert!(
                     action_id.is_none(),
@@ -3269,7 +3555,7 @@ mod tests {
     }
 
     #[test]
-    fn search_pseudo_row_does_not_expand() {
+    fn search_pseudo_row_expands() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let registry = ActionRegistry::defaults();
         let entries = build_entries(&all_contexts(), &registry, true);
@@ -3299,8 +3585,8 @@ mod tests {
             );
             assert_eq!(
                 out,
-                ShortcutsHelpOutcome::Unchanged,
-                "search pseudo-row must stay inert for {code:?}, got {out:?}"
+                ShortcutsHelpOutcome::ToggleExpand(ExpandKey::Pseudo("search")),
+                "search pseudo-row must expand for {code:?}, got {out:?}"
             );
         }
     }

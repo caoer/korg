@@ -93,10 +93,13 @@ pub(super) fn dispatch_cancel_turn(app: &mut AppView) -> Vec<Effect> {
                 rewind_if_pristine: false,
             }];
         }
-        if !agent.session.state.is_turn_running() {
+        if !agent.session.state.is_turn_running() && !agent.session.state.is_compact_running() {
             return vec![];
         }
-        if let Some(stop) = resolved_pref {
+        if agent.session.state.is_compact_running() {
+            // No subagent picker for `/compact` — just stop the generation.
+            resolved_pref.or(Some(true))
+        } else if let Some(stop) = resolved_pref {
             Some(stop)
         } else {
             // Check all running subagents, not just those from the current turn.
@@ -106,7 +109,7 @@ pub(super) fn dispatch_cancel_turn(app: &mut AppView) -> Vec<Effect> {
             let running_count = agent
                 .subagent_sessions
                 .values()
-                .filter(|s| s.is_running())
+                .filter(|s| s.is_running() && s.workflow_run_id.is_none())
                 .count();
             if running_count > 0 && agent.cancel_turn_view.is_none() {
                 agent.cancel_turn_view = Some(crate::views::modal::CancelTurnViewState {
@@ -183,6 +186,22 @@ pub(super) fn do_cancel_turn(app: &mut AppView, cancel_subagents: bool) -> Vec<E
     let Some(agent) = app.agents.get_mut(&id) else {
         return vec![];
     };
+    if agent.session.state.is_compact_running() {
+        agent.session.cancel_compact_command();
+        agent.cancel_turn_view = None;
+        agent.cancel_turn_buttons.clear();
+        drain_permission_queue(agent);
+        let Some(session_id) = agent.session.session_id.clone() else {
+            return vec![];
+        };
+        agent.clear_send_now_expectation();
+        return vec![Effect::CancelTurn {
+            session_id,
+            cancel_subagents,
+            trigger: agent.cancel_trigger_hint.take(),
+            rewind_if_pristine: false,
+        }];
+    }
     if !agent.session.state.is_turn_running() {
         return vec![];
     }
@@ -219,16 +238,29 @@ pub(super) fn do_cancel_turn(app: &mut AppView, cancel_subagents: bool) -> Vec<E
         Some(stashed) => agent.scrollback.is_committed(stashed.scrollback_entry),
         None => false,
     };
+    // The rewind REPLACES the composer with the stashed in-flight prompt.
+    // Esc (and the mouse stop / palette cancel) fire with the draft intact —
+    // unlike keyboard Ctrl+C, which only cancels on an empty prompt — so a
+    // non-empty composer holds a NEWER draft the rewind would clobber.
+    // Trigger-agnostic on purpose: fall back to the standard cancel.
+    let composer_has_draft = !agent.prompt.text().is_empty() || !agent.prompt.images.is_empty();
     let rewinding = agent.shared_queue.is_empty()
         && app.cancel_rewind_enabled
         && agent.session.in_flight_prompt.is_some()
         && agent.session.pending_prompts.is_empty()
-        && !in_flight_committed;
+        && !in_flight_committed
+        && !composer_has_draft;
     if rewinding && let Some(stashed) = agent.session.in_flight_prompt.take() {
+        if let Some(pid) = agent.session.current_prompt_id.clone() {
+            agent.note_rewound_prompt(&pid);
+        }
         agent.prompt.set_text(&stashed.text);
         agent.prompt.restore_chip_elements(&stashed.chip_elements);
         agent.prompt.set_images(stashed.images);
         agent.prompt.set_cursor(stashed.text.len());
+        for id in stashed.combined_scrollback_entries {
+            agent.scrollback.remove_entry(id);
+        }
         agent.scrollback.remove_entry(stashed.scrollback_entry);
         // Full state reset: tracker cleanup + state Idle + clear timing
         // fields + clear current_prompt_id.
@@ -411,7 +443,7 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
             && agent.session.current_prompt_id.is_none()
         {
             if p.prompt_id != pending.prompt_id && agent.should_adopt_running_prompt(&p.prompt_id) {
-                apply_turn_start_shim(agent, p.prompt_id, p.text, &p.kind)
+                apply_turn_start_shim(agent, p.prompt_id, p.text, &p.kind, p.combined_texts)
             } else {
                 agent.discard_pending_adoption_updates(&p.prompt_id);
                 None
@@ -527,12 +559,6 @@ pub(super) fn dispatch_demote_to_background(app: &mut AppView) -> Vec<Effect> {
         tool_call_id,
     }]
 }
-
-// TODO: Add dispatch_cancel_command() once xai-grok-shell supports proper
-// server-side cancellation for /compact. Currently, the compaction handler
-// uses spawn_local with no cancellation token, and blindly replaces the
-// conversation history when done — so prompts sent after a client-side
-// cancel would be lost.
 
 // TaskResult handlers.
 

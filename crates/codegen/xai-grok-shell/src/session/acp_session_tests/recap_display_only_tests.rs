@@ -9,6 +9,148 @@ use super::support::*;
 use super::*;
 use xai_grok_sampling_types::ConversationItem;
 
+/// Serializes `items` the way a main turn would, so auxiliary calls can be compared against the real wire shape.
+fn main_turn_input(items: Vec<ConversationItem>) -> Vec<serde_json::Value> {
+    let request = xai_grok_sampling_types::ConversationRequest {
+        items,
+        model: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let mapped = async_openai::types::responses::CreateResponse::from(&request);
+    serde_json::to_value(&mapped).expect("request serializes")["input"]
+        .as_array()
+        .expect("input is an array")
+        .clone()
+}
+
+/// Checks that an auxiliary call replays the parent conversation verbatim and appends one instruction. A prefix that shifts cannot hit the cache.
+fn assert_rides_parent_prefix(
+    body: &serde_json::Value,
+    parent: Vec<ConversationItem>,
+    label: &str,
+) {
+    let expected = main_turn_input(parent);
+    let actual = body["input"].as_array().expect("input must be present");
+    assert!(
+        actual.len() > expected.len(),
+        "{label}: auxiliary input ({}) must extend the parent ({})",
+        actual.len(),
+        expected.len()
+    );
+    assert_eq!(
+        &actual[..expected.len()],
+        expected.as_slice(),
+        "{label}: prefix diverges from the main turn"
+    );
+    assert_eq!(
+        actual.len(),
+        expected.len() + 1,
+        "{label}: exactly one appended instruction turn"
+    );
+}
+
+/// Reasoning effort sits ahead of the conversation in the prompt, so an auxiliary call that drops it diverges from the main turn right away.
+#[tokio::test(flavor = "current_thread")]
+async fn auxiliary_calls_send_the_session_reasoning_effort() {
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("an answer");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            // Low is not the model default, so a fallback would show up in the assert below.
+            cfg.reasoning_effort = Some(xai_grok_sampling_types::ReasoningEffort::Low);
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::assistant("it enforces shared-xor-mutable"),
+            ]);
+
+            actor
+                .handle_side_question("what does xor mean here?")
+                .await
+                .expect("side question must succeed");
+
+            let requests = server.requests();
+            let body = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .and_then(|r| r.body.as_ref())
+                .expect("btw body must be JSON");
+            assert_eq!(
+                body["reasoning"]["effort"].as_str(),
+                Some("low"),
+                "side question must send the session's effort, not the model default: {}",
+                body["reasoning"]
+            );
+        })
+        .await;
+}
+
+/// When a backend drops `prompt_cache_key`, the conv id is all that ties the call to its conversation, so it must be the parent session id.
+#[tokio::test(flavor = "current_thread")]
+async fn side_question_routes_on_the_session_id_when_the_key_is_not_forwarded() {
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("an answer");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::ChatCompletions;
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::assistant("it enforces shared-xor-mutable"),
+            ]);
+
+            actor
+                .handle_side_question("what does xor mean here?")
+                .await
+                .expect("side question must succeed");
+
+            let requests = server.requests();
+            let req = requests.last().expect("a request must be recorded");
+            let session_id = actor.session_info.id.to_string();
+            assert_eq!(
+                req.header("x-grok-conv-id"),
+                Some(session_id.as_str()),
+                "on a backend that drops the cache key the conv id must be the parent session id"
+            );
+            let req_id = req
+                .header("x-grok-req-id")
+                .expect("req id must still be sent");
+            assert!(
+                req_id.starts_with("xai-btw-"),
+                "the btw label moves to the req id: {req_id}"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn new_prompt_cancels_in_flight_recap_epoch() {
     let local = tokio::task::LocalSet::new();
@@ -64,6 +206,7 @@ async fn queue_input_user_prompt_bumps_recap_epoch() {
                     None,
                     false,
                     None,
+                    /*tool_overrides_update*/ None,
                     respond_to,
                     None,
                     None,
@@ -103,6 +246,7 @@ async fn queue_input_synthetic_does_not_bump_recap_epoch() {
                     None,
                     false,
                     None,
+                    /*tool_overrides_update*/ None,
                     respond_to,
                     None,
                     None,
@@ -114,6 +258,27 @@ async fn queue_input_synthetic_does_not_bump_recap_epoch() {
                 "synthetic queue_input must leave recap epoch alone"
             );
             assert!(!actor.recap_was_cancelled(epoch0));
+        })
+        .await;
+}
+
+/// A second auto recap must not clear another recap's in-flight claim.
+#[tokio::test(flavor = "current_thread")]
+async fn skipped_auto_recap_leaves_in_flight_claim() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+
+            actor.recap_in_flight.set(true);
+            actor.handle_recap(true).await;
+            assert!(
+                actor.recap_in_flight.get(),
+                "skipped auto recap must not clear another recap's in-flight claim"
+            );
         })
         .await;
 }
@@ -629,4 +794,469 @@ fn over_budget_recap_serializes_to_well_formed_messages_request() {
         tool_use_ids.is_subset(&tool_result_ids),
         "no dangling tool_use: uses={tool_use_ids:?} results={tool_result_ids:?}"
     );
+}
+
+/// Recap wire shape: main-turn tools + `prompt_cache_key` = session id, so the
+/// request rides the parent turn's prefix cache instead of cold-prefilling.
+#[tokio::test(flavor = "current_thread")]
+async fn recap_request_rides_parent_prompt_cache() {
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            // Register a real tool so the "recap sends the main turn's tools"
+            // assertion is non-vacuous.
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("You asked about the borrow checker.");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::assistant("it enforces shared-xor-mutable"),
+            ]);
+
+            actor.handle_recap(false).await;
+
+            assert!(
+                server.has_responses_request(),
+                "recap must hit /v1/responses"
+            );
+            let requests = server.requests();
+            let recap_req = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .expect("a responses request must be recorded");
+
+            let conv_id = recap_req
+                .header("x-grok-conv-id")
+                .expect("recap must send x-grok-conv-id");
+            assert!(
+                conv_id.starts_with("recap-"),
+                "conv id keeps the recap-* label: {conv_id}"
+            );
+
+            let body = recap_req.body.as_ref().expect("recap body must be JSON");
+            assert_eq!(
+                body["prompt_cache_key"].as_str(),
+                Some(actor.session_info.id.to_string().as_str()),
+                "prompt_cache_key must be the parent session id for sticky routing"
+            );
+            let main_turn_specs =
+                actor.turn_base_tool_specs(&actor.prepare_tool_definitions().await);
+            assert!(!main_turn_specs.is_empty(), "test env must expose tools");
+            let tools = body["tools"].as_array().expect("tools must be present");
+            assert_eq!(
+                tools.len(),
+                main_turn_specs.len(),
+                "recap must send exactly the main turn's tool specs"
+            );
+        })
+        .await;
+}
+
+/// Hosted tools serialize into the token prefix on the Responses path, so a recap in a backend-search session must send the main turn's hosted
+/// tools or its prefix diverges and cold-misses the cache.
+#[tokio::test(flavor = "current_thread")]
+async fn recap_request_sends_hosted_tools_under_backend_search() {
+    use xai_grok_sampling_types::HostedTool;
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            // Backend-search fixture: agent carries hosted tools and both gates are on.
+            {
+                let mut agent_slot = actor.agent.borrow_mut();
+                let agent = &*agent_slot;
+                *agent_slot = xai_grok_agent::Agent::new(
+                    agent.definition().clone(),
+                    agent.prompt_context().clone(),
+                    agent.system_prompt().to_string(),
+                    std::sync::Arc::clone(agent.tool_bridge()),
+                    agent.reminder_policy().clone(),
+                    agent.compaction_policy().clone(),
+                    vec![HostedTool::WebSearch { options: None }],
+                    true,
+                );
+            }
+            actor.supports_backend_search.set(true);
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("You asked about the borrow checker.");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::assistant("it enforces shared-xor-mutable"),
+            ]);
+
+            actor.handle_recap(false).await;
+
+            let requests = server.requests();
+            let recap_req = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .expect("a responses request must be recorded");
+            let body = recap_req.body.as_ref().expect("recap body must be JSON");
+            let tools = body["tools"].as_array().expect("tools must be present");
+
+            assert!(
+                tools
+                    .iter()
+                    .any(|t| t["type"].as_str() == Some("web_search")),
+                "recap must send the main turn's hosted tools: {tools:?}"
+            );
+            // Function tools must still match the main turn's specs exactly.
+            let main_turn_specs =
+                actor.turn_base_tool_specs(&actor.prepare_tool_definitions().await);
+            assert!(!main_turn_specs.is_empty(), "test env must expose tools");
+            let function_tools = tools
+                .iter()
+                .filter(|t| t["type"].as_str() == Some("function"))
+                .count();
+            assert_eq!(
+                function_tools,
+                main_turn_specs.len(),
+                "hosted tools augment, not replace, the main turn's function tools"
+            );
+        })
+        .await;
+}
+
+/// A recap must serialize the main turn's *effective* hosted tools, so an active per-turn cutoff
+/// reaches the recap's `x_search` entry rather than an unbounded tool.
+#[tokio::test(flavor = "current_thread")]
+async fn recap_hosted_tools_reflect_the_active_per_turn_override() {
+    use xai_grok_sampling_types::{HostedTool, SearchDateBound, ToolOverrides, XSearchOptions};
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            // Backend-search fixture seeded with an *unbounded* x_search (options: None), so any
+            // bound the recap sends can only have come from the per-turn override below.
+            {
+                let mut agent_slot = actor.agent.borrow_mut();
+                let agent = &*agent_slot;
+                *agent_slot = xai_grok_agent::Agent::new(
+                    agent.definition().clone(),
+                    agent.prompt_context().clone(),
+                    agent.system_prompt().to_string(),
+                    std::sync::Arc::clone(agent.tool_bridge()),
+                    agent.reminder_policy().clone(),
+                    agent.compaction_policy().clone(),
+                    vec![HostedTool::XSearch { options: None }],
+                    true,
+                );
+            }
+            actor.supports_backend_search.set(true);
+
+            // A per-turn cutoff (toDate only), with no definition seed: the recap must reflect it.
+            *actor.tool_overrides.borrow_mut() = Some(ToolOverrides {
+                x_search: Some(XSearchOptions {
+                    date_bound: Some(
+                        SearchDateBound::new(None, Some("2024-03-15".to_string())).unwrap(),
+                    ),
+                }),
+                web_search: None,
+            });
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("recap summary");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::assistant("it enforces shared-xor-mutable"),
+            ]);
+
+            actor.handle_recap(false).await;
+
+            let requests = server.requests();
+            let recap_req = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .expect("a responses request must be recorded");
+            let body = recap_req.body.as_ref().expect("recap body must be JSON");
+            let tools = body["tools"].as_array().expect("tools must be present");
+            let x_search = tools
+                .iter()
+                .find(|t| t["type"].as_str() == Some("x_search"))
+                .expect("recap must send the x_search hosted tool");
+            assert_eq!(
+                x_search["to_date"].as_str(),
+                Some("2024-03-15"),
+                "recap must serialize the per-turn override's cutoff, not the unbounded seed: {x_search:?}"
+            );
+        })
+        .await;
+}
+
+/// A `/btw` call sends the main turn's tools and the session id as `prompt_cache_key`, so it reuses the parent's cached prefix.
+#[tokio::test(flavor = "current_thread")]
+async fn side_question_request_rides_parent_prompt_cache() {
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("The borrow checker enforces shared-xor-mutable.");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::assistant("it enforces shared-xor-mutable"),
+            ]);
+
+            let answer = actor
+                .handle_side_question("what does xor mean here?")
+                .await
+                .expect("side question must succeed against the mock server");
+            assert!(!answer.is_empty());
+
+            assert!(
+                server.has_responses_request(),
+                "side question must hit /v1/responses"
+            );
+            let requests = server.requests();
+            let btw_req = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .expect("a responses request must be recorded");
+
+            let conv_id = btw_req
+                .header("x-grok-conv-id")
+                .expect("side question must send x-grok-conv-id");
+            assert!(
+                conv_id.starts_with("btw-"),
+                "conv id keeps the btw-* label: {conv_id}"
+            );
+
+            let body = btw_req.body.as_ref().expect("btw body must be JSON");
+            assert_eq!(
+                body["prompt_cache_key"].as_str(),
+                Some(actor.session_info.id.to_string().as_str()),
+                "prompt_cache_key must be the parent session id for sticky routing"
+            );
+            let tools = body["tools"].as_array().expect("tools must be present");
+
+            // The fixture registers `update_goal`, so an empty or unrelated tool list cannot pass.
+            let sent: Vec<&str> = tools
+                .iter()
+                .filter(|t| t["type"] == "function")
+                .map(|t| t["name"].as_str().unwrap_or_default())
+                .collect();
+            assert_eq!(
+                sent,
+                vec!["update_goal"],
+                "side question must send the fixture's main-turn tool"
+            );
+
+            // Compare the whole array: name, description, and schema must match the main turn, in order.
+            let main_turn_specs =
+                actor.turn_base_tool_specs(&actor.prepare_tool_definitions().await);
+            let expected: Vec<serde_json::Value> = main_turn_specs
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "type": "function",
+                        "name": s.name,
+                        "description": s.description,
+                        "parameters": s.parameters,
+                    })
+                })
+                .collect();
+            assert_eq!(
+                tools, &expected,
+                "side question tools must equal the main turn's specs verbatim"
+            );
+
+            // The main turn sends no hosted search here, so the side question must not add one.
+            assert!(
+                actor.hosted_tools_for_turn().is_empty(),
+                "fixture must have backend search off"
+            );
+            assert!(
+                !tools.iter().any(|t| t["type"] != "function"),
+                "no hosted tools may be added to a side question the main turn would not send: {tools:?}"
+            );
+        })
+        .await;
+}
+
+/// Recap and `/btw` must replay the parent conversation verbatim and append one instruction. The cache key buys nothing if the prefix moved.
+#[tokio::test(flavor = "current_thread")]
+async fn auxiliary_calls_keep_the_main_turn_prefix() {
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("a summary");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            // The Responses backend keeps reasoning, so it belongs in the prefix both calls have to reproduce.
+            let parent = vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
+                    "recalling the aliasing rules",
+                )),
+                ConversationItem::assistant("it enforces shared-xor-mutable"),
+            ];
+            actor.chat_state_handle.replace_conversation(parent.clone());
+
+            actor
+                .handle_side_question("what does xor mean here?")
+                .await
+                .expect("side question must succeed");
+            let requests = server.requests();
+            let btw_body = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .and_then(|r| r.body.as_ref())
+                .expect("btw body must be JSON");
+            assert_rides_parent_prefix(btw_body, parent.clone(), "/btw");
+
+            actor.handle_recap(false).await;
+            let requests = server.requests();
+            let recap_body = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .and_then(|r| r.body.as_ref())
+                .expect("recap body must be JSON");
+            assert_rides_parent_prefix(recap_body, parent, "recap");
+        })
+        .await;
+}
+
+/// A mid-turn `/btw` must not send a reasoning item whose assistant the trim removed, or the request goes out with an unpaired prefix.
+#[tokio::test(flavor = "current_thread")]
+async fn side_question_trims_reasoning_orphaned_by_mid_turn_truncation() {
+    use xai_grok_sampling_types::conversation::{AssistantItem, ToolCall};
+    use xai_grok_test_support::MockInferenceServer;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (gateway_tx, _grx) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _prx) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+            let actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
+            *actor.agent.borrow_mut() = test_agent_with_goal_tool().await;
+
+            let server = MockInferenceServer::start().await.unwrap();
+            server.set_response("xor means one or the other, not both.");
+            let mut cfg = actor.chat_state_handle.get_sampling_config().await.unwrap();
+            cfg.base_url = server.url();
+            // Responses backend keeps reasoning, which is what creates the orphan.
+            cfg.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+            actor.chat_state_handle.update_sampling_config(cfg);
+
+            // Mid-turn shape: the tool call is still in flight, so the reasoning before it has no result behind it.
+            actor.chat_state_handle.replace_conversation(vec![
+                ConversationItem::system("you are a coding agent"),
+                ConversationItem::user("explain the borrow checker"),
+                ConversationItem::Reasoning(xai_grok_sampling_types::synthesized_reasoning_item(
+                    "planning the file read",
+                )),
+                ConversationItem::Assistant(AssistantItem {
+                    content: String::new().into(),
+                    tool_calls: vec![ToolCall {
+                        id: "tc1".into(),
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    }],
+                    model_id: None,
+                    model_fingerprint: None,
+                    reasoning_effort: None,
+                }),
+            ]);
+
+            actor
+                .handle_side_question("what does xor mean here?")
+                .await
+                .expect("side question must succeed against the mock server");
+
+            let requests = server.requests();
+            let btw_req = requests
+                .iter()
+                .rev()
+                .find(|r| r.path.contains("responses"))
+                .expect("a responses request must be recorded");
+            let body = btw_req.body.as_ref().expect("btw body must be JSON");
+            let input = body["input"].as_array().expect("input must be present");
+
+            let kinds: Vec<&str> = input
+                .iter()
+                .map(|i| i["type"].as_str().unwrap_or("message"))
+                .collect();
+            assert!(
+                !kinds.contains(&"reasoning"),
+                "reasoning orphaned by the mid-turn trim must not be sent: {kinds:?}"
+            );
+            assert!(
+                !kinds.contains(&"function_call"),
+                "the in-flight tool call must be trimmed: {kinds:?}"
+            );
+        })
+        .await;
 }

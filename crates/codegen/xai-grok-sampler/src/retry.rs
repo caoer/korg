@@ -156,6 +156,9 @@ pub fn classify_error(
     if err.is_encrypted_content_error() {
         return RetryDecision::EmitToSession(clone_error(err));
     }
+    if max_retries == 0 {
+        return RetryDecision::Fatal(clone_error(err));
+    }
 
     // 413 Payload Too Large: strip inline images and try once. The
     // caller checks if there are images left after the strip; if not,
@@ -170,26 +173,20 @@ pub fn classify_error(
         return RetryDecision::RetryWithImageStrip;
     }
 
-    // Server explicitly said don't retry (x-should-retry: false).
-    // Trust the server — it knows if the error is request-content-caused
-    // (e.g. malformed tool call in conversation history) vs transient.
-    //
-    // x-should-retry: true is intentionally NOT handled here — we only
-    // use the header to suppress retries (false), not to force them
-    // (true). Forcing retries on non-retryable status codes could
-    // amplify failures. true falls through to existing status-code logic.
+    // Shared retry vetoes (`SamplingError::is_retry_vetoed`, also used by
+    // one-shot callers like /btw):
+    // - x-should-retry: false — trust the server, it knows if the error is
+    //   request-content-caused (e.g. malformed tool call in history) vs
+    //   transient. x-should-retry: true is intentionally NOT handled — the
+    //   header only suppresses retries; forcing them on non-retryable
+    //   statuses could amplify failures.
+    // - Context-window / size overflow — deterministic, re-sending the same
+    //   (or larger) payload always fails, whatever status the backend used.
     //
     // Checked AFTER image-strip guards: image stripping changes the
     // request payload, so a server "don't retry" on the original
     // request doesn't apply to the stripped request.
-    if let Some(false) = err.should_retry_header() {
-        return RetryDecision::Fatal(clone_error(err));
-    }
-
-    // Context-window / size overflow is deterministic — re-sending the same (or
-    // larger) payload always fails — so never retry it, whatever status the backend
-    // used (in-stream `ResponseError`→500, HTTP 400/500, OpenAI/Anthropic variants).
-    if err.is_context_length_error() {
+    if err.is_retry_vetoed() {
         return RetryDecision::Fatal(clone_error(err));
     }
 
@@ -209,6 +206,9 @@ pub fn classify_error(
     if err.is_rate_limited() {
         let next_attempt = retry_count + 1;
         let effective_cap = max_retries.min(rate_limit_threshold);
+        if effective_cap == 0 {
+            return RetryDecision::Fatal(clone_error(err));
+        }
         if next_attempt >= effective_cap {
             return RetryDecision::Fatal(clone_error(err));
         }
@@ -227,7 +227,7 @@ pub fn classify_error(
     // later retries just back off.
     if err.is_retryable() {
         let next_attempt = retry_count + 1;
-        if next_attempt >= max_retries {
+        if max_retries == 0 || next_attempt >= max_retries {
             return RetryDecision::Fatal(clone_error(err));
         }
         let backoff = err
@@ -257,10 +257,10 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
     };
 
     match err {
-        SamplingError::Auth(msg) => {
+        SamplingError::Auth { message, .. } => {
             format!(
                 "{}Authentication failed: {}. Please check your API key configuration.",
-                retry_prefix, msg
+                retry_prefix, message
             )
         }
         SamplingError::InvalidConfiguration(msg) => {
@@ -383,7 +383,13 @@ pub fn format_sampling_error(err: &SamplingError, retry_count: Option<u32>) -> S
 /// retry budget re-generating a response that fails the same way.
 pub(crate) fn clone_error(err: &SamplingError) -> SamplingError {
     match err {
-        SamplingError::Auth(msg) => SamplingError::Auth(msg.clone()),
+        SamplingError::Auth {
+            message,
+            credential,
+        } => SamplingError::Auth {
+            message: message.clone(),
+            credential: *credential,
+        },
         SamplingError::InvalidConfiguration(msg) => SamplingError::InvalidConfiguration(msg),
         SamplingError::Http(e) => {
             // reqwest::Error is not Clone; preserve the rendered message
@@ -514,9 +520,9 @@ mod tests {
 
     #[test]
     fn classify_auth_error_emits_to_session() {
-        let err = SamplingError::Auth("bad token".into());
+        let err = SamplingError::auth_unknown("bad token");
         match classify_error(&err, 0, 5, RATE_LIMIT_RETRY_THRESHOLD) {
-            RetryDecision::EmitToSession(SamplingError::Auth(_)) => {}
+            RetryDecision::EmitToSession(SamplingError::Auth { .. }) => {}
             other => panic!("expected EmitToSession(Auth), got {other:?}"),
         }
     }
@@ -616,6 +622,34 @@ mod tests {
                 assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
             }
             other => panic!("expected Fatal at threshold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_retry_budget_never_reuses_a_model_output_cap() {
+        for err in [
+            api_err(StatusCode::INTERNAL_SERVER_ERROR, "boom"),
+            api_err(StatusCode::PAYLOAD_TOO_LARGE, "too big"),
+            api_err(StatusCode::BAD_REQUEST, "Could not process image"),
+            SamplingError::EmptyResponse {
+                context: xai_grok_sampling_types::EmptyResponseContext {
+                    reason: xai_grok_sampling_types::EmptyReason::NoVisibleContent,
+                    had_reasoning: false,
+                    content_len: 0,
+                    tool_call_count: 0,
+                    finish_reason: Some("stop".into()),
+                    completion_tokens: Some(1),
+                    reasoning_tokens: Some(0),
+                    prompt_tokens: Some(10),
+                    model: "m".into(),
+                    first_choice_seen: true,
+                },
+            },
+        ] {
+            assert!(matches!(
+                classify_error(&err, 0, 0, RATE_LIMIT_RETRY_THRESHOLD),
+                RetryDecision::Fatal(_)
+            ));
         }
     }
 
@@ -729,14 +763,14 @@ mod tests {
 
     #[test]
     fn format_includes_retry_prefix_when_count_present() {
-        let err = SamplingError::Auth("bad".into());
+        let err = SamplingError::auth_unknown("bad");
         let s = format_sampling_error(&err, Some(3));
         assert!(s.starts_with("Request failed after 3 retries."));
     }
 
     #[test]
     fn format_omits_retry_prefix_when_count_absent() {
-        let err = SamplingError::Auth("bad".into());
+        let err = SamplingError::auth_unknown("bad");
         let s = format_sampling_error(&err, None);
         assert!(!s.starts_with("Request failed after"));
         assert!(s.starts_with("Authentication failed:"));

@@ -155,6 +155,10 @@ pub struct BashCommandPermission {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BashCommandSelectedTerms {
     pub command_parts: Vec<String>,
+    /// The user authored a free-form glob pattern (pattern editor) rather than
+    /// a literal word-scope selection, so it must be matched with glob semantics.
+    #[serde(default)]
+    pub is_glob: bool,
 }
 
 /// Delimiter used to qualify MCP tool names as `"<server>__<tool>"`.
@@ -287,6 +291,9 @@ pub enum PromptOutcome {
     /// Matches the UX of "Yes, allow all edits during this session".
     AllowEditsForSession,
     AllowAlwaysBashCommand(String),
+    /// A free-form glob pattern authored in the "Always allow" editor. Matched
+    /// with glob semantics (unlike the literal-prefix [`Self::AllowAlwaysBashCommand`]).
+    AllowAlwaysBashGlob(String),
     AllowAlwaysDomain(String),
     /// Persist this exact MCP tool name in `allowed_mcp_tools`.
     AllowAlwaysMcpTool(String),
@@ -565,6 +572,22 @@ impl AcpPrompter {
         }
     }
 
+    /// Request `_meta`: bash selection scope, or protected-edit description for Edit.
+    fn permission_request_meta(
+        &self,
+        access: &AccessKind,
+        protected_edit: Option<crate::permission::ProtectedEditReason>,
+    ) -> Option<acp::Meta> {
+        if let Some(bash) = self.bash_selection_meta(access) {
+            return Some(bash);
+        }
+        let reason = protected_edit?;
+        let payload = crate::permission::ProtectedEditPermission::from_reason(reason);
+        serde_json::to_value(payload)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+    }
+
     /// Build the per-access-kind option map WITHOUT the
     /// "enable always-approve mode" prepend. Kept as a separate inner
     /// fn so `build_options` can wrap the result with one prepend call
@@ -719,6 +742,7 @@ impl AcpPrompter {
         &self,
         access: &AccessKind,
         tool_call_update: &acp::ToolCallUpdate,
+        protected_edit: Option<crate::permission::ProtectedEditReason>,
     ) -> PromptOutcome {
         let tool_name = tool_name_for_access(access);
         // events.jsonl: `PermissionRequested` at prompt-start. The `Instant`
@@ -753,7 +777,7 @@ impl AcpPrompter {
                     tool_call_update.clone(),
                     permission_options.values().cloned().collect(),
                 )
-                .meta(self.bash_selection_meta(access));
+                .meta(self.permission_request_meta(access, protected_edit));
                 match self.gateway.request_permission(req).await {
                     Ok(resp) => match resp.outcome {
                         acp::RequestPermissionOutcome::Cancelled => PromptOutcome::Cancelled,
@@ -834,6 +858,7 @@ fn permission_decision_for_outcome(outcome: &PromptOutcome) -> PermissionDecisio
         | PromptOutcome::AllowAlways
         | PromptOutcome::AllowEditsForSession
         | PromptOutcome::AllowAlwaysBashCommand(_)
+        | PromptOutcome::AllowAlwaysBashGlob(_)
         | PromptOutcome::AllowAlwaysDomain(_)
         | PromptOutcome::AllowAlwaysMcpTool(_)
         | PromptOutcome::AllowAlwaysMcpServer(_) => PermissionDecision::Allow,
@@ -917,9 +942,12 @@ fn map_selected_outcome(
                         )
                         .ok()
                     }) {
-                        PromptOutcome::AllowAlwaysBashCommand(
-                            bash_selected_commands.command_parts.join(" "),
-                        )
+                        let pattern = bash_selected_commands.command_parts.join(" ");
+                        if bash_selected_commands.is_glob {
+                            PromptOutcome::AllowAlwaysBashGlob(pattern)
+                        } else {
+                            PromptOutcome::AllowAlwaysBashCommand(pattern)
+                        }
                     } else if let AccessKind::Bash(cmd) = access {
                         // No interactive selection meta (e.g. desktop client).
                         // Compute the primary command from the script.
@@ -1118,6 +1146,7 @@ mod tests {
         // BashCommandSelectedTerms meta and wins over the raw script.
         let meta = serde_json::to_value(BashCommandSelectedTerms {
             command_parts: vec!["cargo".to_owned(), "test".to_owned()],
+            is_glob: false,
         })
         .unwrap()
         .as_object()
@@ -1625,7 +1654,7 @@ mod tests {
             acp::ToolCallUpdateFields::default(),
         );
 
-        let outcome = prompter.request(&access, &tool_call_update).await;
+        let outcome = prompter.request(&access, &tool_call_update, None).await;
         assert!(
             matches!(outcome, PromptOutcome::Error(_)),
             "dropped gateway receiver should yield PromptOutcome::Error"
@@ -1675,7 +1704,7 @@ mod tests {
             acp::ToolCallId::new(Arc::from("tc-2")),
             acp::ToolCallUpdateFields::default(),
         );
-        let outcome = prompter.request(&access, &tool_call_update).await;
+        let outcome = prompter.request(&access, &tool_call_update, None).await;
         assert!(matches!(outcome, PromptOutcome::Error(_)));
     }
 }

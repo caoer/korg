@@ -137,6 +137,12 @@ fn team_principal_signed_in() -> std::io::Result<bool> {
 /// configured and no team signed in (logout). A configured deployment key keeps
 /// its files (original "never auto-deletes" behavior). Runs at startup and on
 /// logout; best-effort.
+///
+/// **fail_closed:** when the marker or on-disk requirements opt in to fail-closed
+/// (or requirements exist but are unreadable), do **not** wipe. A personal/User
+/// principal (or signed-out auth) must not escape enforced policy by swapping
+/// `auth.json` and letting orphan clear delete the artifacts. Non-fail-closed
+/// team policy still clears on logout as before.
 pub fn clear_orphan() {
     if resolve_deployment_key().is_some() {
         return;
@@ -153,6 +159,12 @@ pub fn clear_orphan() {
     let Some(_lock) = try_lock_managed_config(&home) else {
         return; // another process is syncing; retry next call
     };
+    if xai_grok_config::fail_closed_policy_armed_at(&home) {
+        tracing::info!(
+            "keeping fail_closed managed policy on disk; no team principal present to own a clear"
+        );
+        return;
+    }
     remove_managed_config_files(&home);
 }
 
@@ -232,10 +244,11 @@ async fn fetch_managed_config(
     token: &str,
     source: ManagedConfigSource,
     max_attempts: u32,
+    echo_principal: Option<&str>,
 ) -> Result<ManagedConfigResponse, ManagedConfigError> {
     crate::http::send_with_retry_escaping_pool(
         move |client: reqwest::Client| async move {
-            fetch_managed_config_once(&client, url, token, source).await
+            fetch_managed_config_once(&client, url, token, source, echo_principal).await
         },
         max_attempts,
         |e: &ManagedConfigError| e.is_retryable(),
@@ -324,14 +337,25 @@ async fn fetch_managed_config_once(
     url: &str,
     token: &str,
     source: ManagedConfigSource,
+    echo_principal: Option<&str>,
 ) -> Result<ManagedConfigResponse, ManagedConfigError> {
-    let resp = match client
+    let mut request = client
         .get(url)
         .header("Authorization", format!("Bearer {}", token))
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
+        .timeout(std::time::Duration::from_secs(15));
+    // Replay-probe echo (telemetry only). Skip on invalid HeaderValue so a
+    // corrupt sidecar never bricks the fetch (echo is fail-open).
+    if let Some(nonce) = xai_grok_config::signed_policy::stored_envelope_nonce(
+        &crate::util::grok_home::grok_home(),
+        echo_principal,
+    ) && let Ok(value) = reqwest::header::HeaderValue::from_str(&nonce)
     {
+        request = request.header(
+            xai_grok_config::signed_policy::MANAGED_CONFIG_NONCE_ECHO_HEADER,
+            value,
+        );
+    }
+    let resp = match request.send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             let status = r.status().as_u16();
@@ -544,7 +568,11 @@ async fn fetch_for_principal(
 
     if let Some(dk) = resolve_deployment_key() {
         let source = ManagedConfigSource::DeploymentKey;
-        match fetch_managed_config(&url, &dk, source, max_attempts).await {
+        // Echo binds to the deployment this key last synced (marker-bound; None
+        // on first sync or after a key rotation — then there is nothing to echo).
+        let echo_principal = crate::config::managed_deployment_id(&deployment_key_fingerprint(&dk));
+        match fetch_managed_config(&url, &dk, source, max_attempts, echo_principal.as_deref()).await
+        {
             // A rejected dk (stale env/config) must not starve a valid team
             // sign-in: fall through. Network/5xx do NOT — same unreachable
             // server, double the latency for nothing.
@@ -569,6 +597,7 @@ async fn fetch_for_principal(
             &auth.key,
             ManagedConfigSource::TeamOauth,
             max_attempts,
+            auth.team_id.as_deref(),
         )
         .await?;
         return Ok(FetchedConfig::Team {

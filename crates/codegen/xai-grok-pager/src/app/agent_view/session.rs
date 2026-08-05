@@ -4,7 +4,7 @@
 use super::test_agent_view;
 use super::{
     ActivePane, AgentView, InlineMediaHitAreas, InputMode, PaneAreas, PluginCtaState,
-    PromptInputMode, PromptMode, SELF_ORIGINATED_PROMPT_CAP, SessionReload,
+    PromptInputMode, PromptMode, REWOUND_PROMPT_ID_CAP, SELF_ORIGINATED_PROMPT_CAP, SessionReload,
 };
 use crate::app::agent::AgentSession;
 use crate::app::app_view::InputOutcome;
@@ -27,6 +27,7 @@ impl AgentView {
     /// outright).
     pub(crate) fn bind_session_id(&mut self, session_id: agent_client_protocol::SessionId) {
         if self.session.session_id.as_ref() != Some(&session_id) {
+            self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
             self.last_seen_event_id = None;
             self.last_applied_event_seq = None;
             self.last_applied_xai_event_seq = None;
@@ -37,6 +38,7 @@ impl AgentView {
     /// Unbind this view from its current session identity.
     pub(crate) fn unbind_session_id(&mut self) {
         if self.session.session_id.take().is_some() {
+            self.session_binding_epoch = self.session_binding_epoch.wrapping_add(1);
             self.clear_minimal_btw_lifecycle();
         }
     }
@@ -60,6 +62,18 @@ impl AgentView {
             .iter()
             .any(|p| p == prompt_id)
     }
+    pub(crate) fn note_rewound_prompt(&mut self, prompt_id: &str) {
+        if self.rewound_prompt_ids.iter().any(|p| p == prompt_id) {
+            return;
+        }
+        self.rewound_prompt_ids.push_back(prompt_id.to_string());
+        while self.rewound_prompt_ids.len() > REWOUND_PROMPT_ID_CAP {
+            self.rewound_prompt_ids.pop_front();
+        }
+    }
+    pub(crate) fn is_rewound_prompt(&self, prompt_id: &str) -> bool {
+        self.rewound_prompt_ids.iter().any(|p| p == prompt_id)
+    }
     /// Create a new agent view with default UI state.
     ///
     /// The prompt widget is initialized with the session's working directory.
@@ -67,6 +81,7 @@ impl AgentView {
         let prompt = PromptWidget::new_with_cwd(&session.cwd);
         let mut view = Self {
             session,
+            session_binding_epoch: 0,
             scrollback,
             prompt,
             tip_typing_dismissed: false,
@@ -77,12 +92,14 @@ impl AgentView {
             shared_queue: Vec::new(),
             attached_as_viewer: false,
             self_originated_prompt_ids: VecDeque::new(),
+            rewound_prompt_ids: VecDeque::new(),
             last_applied_event_seq: None,
             last_applied_xai_event_seq: None,
             last_seen_event_id: None,
             session_reload: None,
             unexpected_replay_drops: 0,
             replayed_terminal_prompts: HashSet::new(),
+            failed_wake_marker_for: None,
             active_pane: ActivePane::Prompt,
             prompt_mode: PromptMode::Normal,
             prompt_input_mode: PromptInputMode::Normal,
@@ -100,17 +117,28 @@ impl AgentView {
             context_state: None,
             chat_kind: false,
             app_chat_mode: false,
+            #[cfg(feature = "local-workspace")]
+            workspace_mode: crate::views::welcome::WelcomeWorkspaceMode::Sandbox,
+            #[cfg(feature = "local-workspace")]
+            workspace_mode_cli_locked: false,
             credit_balance: None,
             auto_topup: None,
             goal_state: None,
-            parked_wait_marker_for: None,
+            workflow_blocks: std::collections::HashMap::new(),
+            workflow_runs: Vec::new(),
+            workflow_run_revisions: std::collections::HashMap::new(),
+            cleared_workflow_runs: std::collections::HashSet::new(),
+            show_workflows: false,
+            workflows_view: crate::views::workflows::WorkflowsViewState::default(),
             pending_stop_hooks: None,
             last_cleared_goal_id: None,
             show_goal_detail: false,
             turn_start_ms: None,
+            turn_start_ms_prompt: None,
             turn_started_at: None,
             first_activity_logged_for: None,
             turn_paused_duration: std::time::Duration::ZERO,
+            turn_paused_wall: std::time::Duration::ZERO,
             self_interjection_ids: std::collections::HashSet::new(),
             last_active_at: Some(Instant::now()),
             current_branch: None,
@@ -172,10 +200,14 @@ impl AgentView {
             hit_plan_button: Default::default(),
             hit_plan_approval_status: Default::default(),
             hit_follow_indicator: Default::default(),
+            hit_response_top_indicator: Default::default(),
             hit_cwd: Default::default(),
             hit_cancel_button: Default::default(),
+            hit_watching_cue: Default::default(),
+            watching_cue_toast_shown: false,
             hit_announcement_hide: Default::default(),
             hit_announcement_cta: Default::default(),
+            privacy_banner: Default::default(),
             hit_upgrade_cta: Default::default(),
             hit_voice_stop_button: Default::default(),
             hit_scrollbar: Default::default(),
@@ -244,6 +276,8 @@ impl AgentView {
             permission_queue: VecDeque::new(),
             next_perm_req_id: 0,
             permission_stashed_prompt: None,
+            permission_stashed_pane: None,
+            permission_pattern_edit: None,
             plan_approval_view: None,
             latest_inline_plan_content: None,
             plan_comments: Vec::new(),
@@ -270,8 +304,12 @@ impl AgentView {
             is_subagent_view: false,
             hit_subagent_frame_close: Default::default(),
             sharing_enabled: false,
+            scheduler_background_loops: None,
+            billing_surface_visible: false,
+            usage_command_visible: true,
             input_log: crate::input_log::InputRingBuffer::new(),
             esc_pressed_at: None,
+            rewind_suppress_deadline: None,
             pending_first_prompt: None,
             pending_fork_banner: None,
             loading_placeholder_id: None,
@@ -306,16 +344,47 @@ impl AgentView {
         view.set_input_mode(mode);
         view
     }
-    /// Clear `turn_started_at` and stamp `last_active_at` to "now".
+    /// Establish read-only child identity before a view is stored or opened.
+    pub(crate) fn mark_as_subagent_view(&mut self) {
+        self.is_subagent_view = true;
+    }
+    /// Register a child view and establish its read-only subagent identity.
+    pub(crate) fn insert_subagent_view(
+        &mut self,
+        child_sid: String,
+        mut child_view: Box<AgentView>,
+    ) {
+        child_view.mark_as_subagent_view();
+        self.subagent_views.insert(child_sid, child_view);
+    }
+    /// Clear the turn-timing fields and stamp `last_active_at` to "now".
     ///
     /// Call this from every site that ends a turn (success, failure,
-    /// cancellation, reconnect cleanup). Centralised so the two
-    /// fields cannot drift apart at the ~10 termination call sites
-    /// across `dispatch.rs` and `event_loop.rs`.
+    /// cancellation, reconnect cleanup). Centralised so the fields cannot
+    /// drift apart at the ~10 termination call sites across `dispatch.rs`
+    /// and `event_loop.rs`. The wall anchor is cleared so a later turn that
+    /// reuses a prompt id (stash-and-resubmit after `/login`) can never
+    /// wall-max against a previous attempt's anchor in
+    /// [`honest_turn_elapsed`].
     pub fn mark_turn_finished(&mut self) {
         self.turn_started_at = None;
         self.turn_paused_duration = std::time::Duration::ZERO;
+        self.turn_paused_wall = std::time::Duration::ZERO;
+        self.turn_start_ms = None;
+        self.turn_start_ms_prompt = None;
         self.last_active_at = Some(Instant::now());
+    }
+    /// Absorb a closing/replaced question view's open span into the turn's
+    /// pause totals, on both clocks — a close site that updated only the
+    /// `Instant` pause would resurface suspend time as worked time in
+    /// [`honest_turn_elapsed`].
+    pub(crate) fn record_question_pause(
+        &mut self,
+        qv: &crate::views::question_view::QuestionViewState,
+    ) {
+        self.turn_paused_duration += qv.opened_at.elapsed();
+        self.turn_paused_wall +=
+            wall_since_ms(qv.opened_at_wall_ms, chrono::Utc::now().timestamp_millis());
     }
     /// Invalidate and clear a minimal `/btw` lifecycle at a session boundary.
     pub(crate) fn clear_minimal_btw_lifecycle(&mut self) {
@@ -336,6 +405,10 @@ impl AgentView {
         self.optimistic_queue_ids.clear();
         self.send_now_awaiting_confirm = None;
         self.send_now_painted_blocks.clear();
+        self.workflow_blocks.clear();
+        self.workflow_run_revisions.clear();
+        self.cleared_workflow_runs.clear();
+        self.workflow_runs.clear();
     }
     /// Open a reconnect reload window: stash the current transcript/tracker
     /// and point the live fields at fresh state for the incoming
@@ -374,6 +447,10 @@ impl AgentView {
                 crate::acp::tracker::AcpUpdateTracker::new(),
             ),
             todo: std::mem::take(&mut self.todo),
+            workflow_blocks: std::mem::take(&mut self.workflow_blocks),
+            workflow_runs: std::mem::take(&mut self.workflow_runs),
+            workflow_run_revisions: std::mem::take(&mut self.workflow_run_revisions),
+            cleared_workflow_runs: std::mem::take(&mut self.cleared_workflow_runs),
             last_seen_event_id: self.last_seen_event_id.clone(),
             last_applied_event_seq: self.last_applied_event_seq,
             last_applied_xai_event_seq: self.last_applied_xai_event_seq,
@@ -476,6 +553,7 @@ impl AgentView {
     pub(crate) fn should_adopt_running_prompt(&self, prompt_id: &str) -> bool {
         crate::app::acp_handler::should_adopt_running_prompt(prompt_id)
             && !self.replayed_terminal_prompts.contains(prompt_id)
+            && !self.is_rewound_prompt(prompt_id)
     }
     /// Finalize a reconnect-reload window and, iff the running prompt is
     /// adoptable, adopt it. Returns whether the window finalized.
@@ -520,6 +598,34 @@ impl AgentView {
         } else if success {
             let tail = std::mem::replace(&mut self.scrollback, reload.scrollback);
             self.scrollback.append_entries_from(tail);
+            self.workflow_blocks.extend(reload.workflow_blocks);
+            {
+                let mut live_by_id: HashMap<String, _> = std::mem::take(&mut self.workflow_runs)
+                    .into_iter()
+                    .map(|run| (run.run_id.clone(), run))
+                    .collect();
+                let mut merged = Vec::with_capacity(reload.workflow_runs.len() + live_by_id.len());
+                for run in reload.workflow_runs {
+                    if let Some(live) = live_by_id.remove(&run.run_id) {
+                        merged.push(live);
+                    } else {
+                        merged.push(run);
+                    }
+                }
+                let mut live_only: Vec<_> = live_by_id.into_values().collect();
+                live_only.sort_by_key(|run| run.received_at);
+                merged.extend(live_only);
+                self.cleared_workflow_runs
+                    .extend(reload.cleared_workflow_runs);
+                merged.retain(|run| !self.cleared_workflow_runs.contains(&run.run_id));
+                self.workflow_runs = merged;
+            }
+            for (run_id, rev) in reload.workflow_run_revisions {
+                self.workflow_run_revisions
+                    .entry(run_id)
+                    .and_modify(|live| *live = (*live).max(rev))
+                    .or_insert(rev);
+            }
             if !reload.saw_todo_update {
                 self.todo = reload.todo;
             }
@@ -533,6 +639,10 @@ impl AgentView {
                 .raise_invalidation_floor(staging_generations);
             self.session.tracker = reload.tracker;
             self.todo = reload.todo;
+            self.workflow_blocks = reload.workflow_blocks;
+            self.workflow_runs = reload.workflow_runs;
+            self.workflow_run_revisions = reload.workflow_run_revisions;
+            self.cleared_workflow_runs = reload.cleared_workflow_runs;
             self.last_seen_event_id = reload.last_seen_event_id;
             self.last_applied_event_seq = reload.last_applied_event_seq;
             self.last_applied_xai_event_seq = reload.last_applied_xai_event_seq;
@@ -552,18 +662,26 @@ impl AgentView {
         self.reset_follow_ups_for_reload();
         dropped_heavy
     }
-    /// Effective turn elapsed time, excluding time spent in question views.
-    ///
-    /// Subtracts both the accumulated `turn_paused_duration` (from previously
-    /// closed question views) and the time elapsed since the current question
-    /// view opened (if one is active).
+    /// Effective turn elapsed time, excluding time spent in question views
+    /// (accumulated pauses plus the currently open one, on both clocks).
     pub fn turn_elapsed(&self) -> Option<std::time::Duration> {
-        let raw = self.turn_started_at?.elapsed();
-        let mut paused = self.turn_paused_duration;
+        let instant_elapsed = self.turn_started_at?.elapsed();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut instant_paused = self.turn_paused_duration;
+        let mut wall_paused = self.turn_paused_wall;
         if let Some(qv) = &self.question_view {
-            paused += qv.opened_at.elapsed();
+            instant_paused += qv.opened_at.elapsed();
+            wall_paused += wall_since_ms(qv.opened_at_wall_ms, now_ms);
         }
-        Some(raw.saturating_sub(paused))
+        Some(honest_turn_elapsed(TurnElapsedParams {
+            instant_elapsed,
+            instant_paused,
+            wall_anchor_ms: self.turn_start_ms,
+            wall_paused,
+            anchor_prompt: self.turn_start_ms_prompt.as_deref(),
+            current_prompt: self.session.current_prompt_id.as_deref(),
+            now_ms,
+        }))
     }
     /// Turn activity for the status spinner, with the implicit "no activity"
     /// gap during a running inference turn resolved into an explicit
@@ -709,7 +827,7 @@ impl AgentView {
     fn has_running_foreground_subagent(&self) -> bool {
         self.subagent_sessions
             .values()
-            .any(|s| s.is_running() && !s.is_background)
+            .any(|s| s.is_running() && !s.is_background && s.workflow_run_id.is_none())
     }
     /// Update context state with a full snapshot from live callers.
     ///
@@ -826,12 +944,19 @@ impl AgentView {
             .registry_mut()
             .set_share_visible(enabled);
     }
-    /// Show or hide the `/usage` slash command in this agent's registry.
-    pub fn set_usage_visible(&mut self, visible: bool) {
+    /// Set [`Self::billing_surface_visible`] (see the field doc) and mirror it
+    /// into this agent's slash controller, so the two can't drift.
+    pub fn set_billing_surface_visible(&mut self, visible: bool) {
+        self.billing_surface_visible = visible;
         self.prompt
             .slash_controller
-            .registry_mut()
-            .set_usage_visible(visible);
+            .set_billing_surface_visible(visible);
+    }
+    pub fn set_usage_command_visible(&mut self, visible: bool) {
+        self.usage_command_visible = visible;
+        self.prompt
+            .slash_controller
+            .set_usage_command_visible(visible);
     }
     /// Replace the restricted slash-command deny list in this agent's
     /// registry (e.g. `/usage` denied on the free / X Basic tiers). Deny
@@ -859,14 +984,16 @@ impl AgentView {
     pub(crate) fn apply_app_scoped_gates(
         &mut self,
         sharing_enabled: bool,
-        usage_visible: bool,
+        billing_surface_visible: bool,
+        usage_command_visible: bool,
         chat_mode: bool,
         screen_mode: crate::app::ScreenMode,
         announcements: &[xai_grok_announcements::RemoteAnnouncement],
         restricted_commands: &[String],
     ) {
         self.set_sharing_enabled(sharing_enabled);
-        self.set_usage_visible(usage_visible);
+        self.set_billing_surface_visible(billing_surface_visible);
+        self.set_usage_command_visible(usage_command_visible);
         self.app_chat_mode = chat_mode;
         self.prompt.set_screen_mode(screen_mode);
         self.set_dashboard_visible(crate::views::dashboard::dashboard_enabled());
@@ -883,6 +1010,168 @@ impl AgentView {
     /// gated on the runtime voice gate (GA default on; kill switch may hide).
     pub fn set_voice_mode_available(&mut self, available: bool) {
         self.prompt.set_voice_visible(available);
+    }
+}
+/// Inputs for [`honest_turn_elapsed`]: the turn span and pause total measured
+/// on each clock, plus the wire anchor's provenance. `now_ms` is injected so
+/// tests control the wall clock.
+struct TurnElapsedParams<'a> {
+    instant_elapsed: std::time::Duration,
+    instant_paused: std::time::Duration,
+    /// `turnStartMs` wire anchor (UTC ms) and the prompt id it was stamped
+    /// for; the anchor counts only when that id matches the running prompt
+    /// (interleaved deltas can re-stamp it with another prompt's anchor).
+    wall_anchor_ms: Option<i64>,
+    wall_paused: std::time::Duration,
+    anchor_prompt: Option<&'a str>,
+    current_prompt: Option<&'a str>,
+    now_ms: i64,
+}
+/// Turn elapsed for [`AgentView::turn_elapsed`], honest across OS suspends
+/// (`Instant` pauses while the machine sleeps; the wall clock keeps
+/// counting). Each span is netted against pauses measured on its own clock,
+/// and the larger net wins; the tests below enumerate the guard cases.
+fn honest_turn_elapsed(params: TurnElapsedParams<'_>) -> std::time::Duration {
+    let instant_net = params.instant_elapsed.saturating_sub(params.instant_paused);
+    let (Some(start_ms), Some(anchor_prompt), Some(current_prompt)) = (
+        params.wall_anchor_ms,
+        params.anchor_prompt,
+        params.current_prompt,
+    ) else {
+        return instant_net;
+    };
+    if anchor_prompt != current_prompt {
+        return instant_net;
+    }
+    let wall_net = wall_since_ms(start_ms, params.now_ms).saturating_sub(params.wall_paused);
+    instant_net.max(wall_net)
+}
+/// Wall-clock span since `start_ms`, clamped to zero when `start_ms`
+/// postdates `now_ms` (skew) so a wall span can never go negative.
+fn wall_since_ms(start_ms: i64, now_ms: i64) -> std::time::Duration {
+    std::time::Duration::from_millis(u64::try_from(now_ms.saturating_sub(start_ms)).unwrap_or(0))
+}
+#[cfg(test)]
+mod honest_turn_elapsed_tests {
+    use super::*;
+    use std::time::Duration;
+    const NOW_MS: i64 = 1_700_000_000_000;
+    const MIN: u64 = 60;
+    const HOUR: u64 = 3_600;
+    /// Valid same-prompt anchor context with zero spans; tests override the
+    /// fields under test via struct-update syntax.
+    fn base() -> TurnElapsedParams<'static> {
+        TurnElapsedParams {
+            instant_elapsed: Duration::ZERO,
+            instant_paused: Duration::ZERO,
+            wall_anchor_ms: None,
+            wall_paused: Duration::ZERO,
+            anchor_prompt: Some("p1"),
+            current_prompt: Some("p1"),
+            now_ms: NOW_MS,
+        }
+    }
+    #[test]
+    fn no_wall_anchor_keeps_instant_net() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(5 * MIN),
+                instant_paused: Duration::from_secs(MIN),
+                ..base()
+            }),
+            Duration::from_secs(4 * MIN)
+        );
+    }
+    #[test]
+    fn suspend_outside_questions_defers_to_wall_net() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(4 * MIN),
+                wall_anchor_ms: Some(NOW_MS - 2 * HOUR as i64 * 1_000),
+                ..base()
+            }),
+            Duration::from_secs(2 * HOUR)
+        );
+    }
+    #[test]
+    fn suspend_while_question_open_is_not_worked_time() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(10 * MIN),
+                instant_paused: Duration::from_secs(5 * MIN),
+                wall_anchor_ms: Some(NOW_MS - (2 * HOUR as i64 + 10 * MIN as i64) * 1_000),
+                wall_paused: Duration::from_secs(2 * HOUR + 5 * MIN),
+                ..base()
+            }),
+            Duration::from_secs(5 * MIN)
+        );
+    }
+    #[test]
+    fn instant_net_bounds_below_after_backward_wall_jump() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(5 * MIN),
+                wall_anchor_ms: Some(NOW_MS - 1_000),
+                ..base()
+            }),
+            Duration::from_secs(5 * MIN)
+        );
+    }
+    #[test]
+    fn foreign_prompt_anchor_falls_back_to_instant_net() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(10 * MIN),
+                instant_paused: Duration::from_secs(4 * MIN),
+                wall_anchor_ms: Some(NOW_MS - 2 * HOUR as i64 * 1_000),
+                anchor_prompt: Some("p-other"),
+                ..base()
+            }),
+            Duration::from_secs(6 * MIN)
+        );
+    }
+    #[test]
+    fn missing_current_prompt_ignores_anchor() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(MIN),
+                wall_anchor_ms: Some(NOW_MS - 2 * HOUR as i64 * 1_000),
+                current_prompt: None,
+                ..base()
+            }),
+            Duration::from_secs(MIN)
+        );
+    }
+    #[test]
+    fn future_wall_anchor_is_ignored() {
+        assert_eq!(
+            honest_turn_elapsed(TurnElapsedParams {
+                instant_elapsed: Duration::from_secs(MIN),
+                wall_anchor_ms: Some(NOW_MS + 60_000),
+                ..base()
+            }),
+            Duration::from_secs(MIN)
+        );
+    }
+    #[test]
+    fn turn_elapsed_reflects_wall_span_for_current_prompt() {
+        let mut view = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        view.turn_started_at = Some(Instant::now());
+        view.turn_start_ms = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+        view.turn_start_ms_prompt = Some("p1".to_string());
+        view.session.current_prompt_id = Some("p1".to_string());
+        assert!(view.turn_elapsed().unwrap() >= Duration::from_secs(59));
+    }
+    #[test]
+    fn turn_elapsed_nets_wall_pauses_against_wall_span() {
+        let mut view = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        view.turn_started_at = Some(Instant::now());
+        view.turn_start_ms = Some(chrono::Utc::now().timestamp_millis() - 60_000);
+        view.turn_start_ms_prompt = Some("p1".to_string());
+        view.session.current_prompt_id = Some("p1".to_string());
+        view.turn_paused_wall = Duration::from_secs(45);
+        let elapsed = view.turn_elapsed().unwrap();
+        assert!(elapsed >= Duration::from_secs(14) && elapsed <= Duration::from_secs(16));
     }
 }
 #[cfg(test)]
@@ -976,9 +1265,10 @@ mod resolve_turn_activity_tests {
         view.session.handle_update(
             acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
                 acp::ToolCallId::new(Arc::from("wait-1")),
-                acp::ToolCallUpdateFields::new().raw_input(Some(serde_json::json!(
-                    { "task_ids" : ["bg-1"], "timeout_ms" : 30_000, }
-                ))),
+                acp::ToolCallUpdateFields::new().raw_input(Some(serde_json::json!({
+                    "task_ids": ["bg-1"],
+                    "timeout_ms": 30_000,
+                }))),
             )),
             &meta,
             &mut view.scrollback,
@@ -1038,9 +1328,10 @@ mod resolve_turn_activity_tests {
                     .kind(acp::ToolKind::Other)
                     .status(acp::ToolCallStatus::Pending)
                     .content(vec![])
-                    .raw_input(Some(serde_json::json!(
-                        { "task_ids" : ["bg-2"], "timeout_ms" : 5_000, }
-                    )))
+                    .raw_input(Some(serde_json::json!({
+                        "task_ids": ["bg-2"],
+                        "timeout_ms": 5_000,
+                    })))
                     .locations(vec![]),
             ),
             &meta,
@@ -1095,10 +1386,10 @@ mod resolve_turn_activity_tests {
                 .kind(acp::ToolKind::Other)
                 .status(acp::ToolCallStatus::Pending)
                 .content(vec![])
-                .raw_input(Some(serde_json::json!(
-                    { "task_ids" : ["bg-a", "missing-b", "missing-c"],
-                    "timeout_ms" : 5_000, }
-                )))
+                .raw_input(Some(serde_json::json!({
+                    "task_ids": ["bg-a", "missing-b", "missing-c"],
+                    "timeout_ms": 5_000,
+                })))
                 .locations(vec![]),
             ),
             &meta,
@@ -1159,10 +1450,10 @@ mod resolve_turn_activity_tests {
                 .kind(acp::ToolKind::Other)
                 .status(acp::ToolCallStatus::Pending)
                 .content(vec![])
-                .raw_input(Some(serde_json::json!(
-                    { "task_ids" : ["bg-long", "missing-b"], "timeout_ms" :
-                    5_000, }
-                )))
+                .raw_input(Some(serde_json::json!({
+                    "task_ids": ["bg-long", "missing-b"],
+                    "timeout_ms": 5_000,
+                })))
                 .locations(vec![]),
             ),
             &meta,
@@ -1207,6 +1498,7 @@ mod resolve_turn_activity_tests {
                 context_source: None,
                 resumed_from: None,
                 capability_mode: None,
+                workflow_run_id: None,
                 context_normalized: false,
                 parent_prompt_id: None,
                 started_at: now,
@@ -1245,9 +1537,10 @@ mod resolve_turn_activity_tests {
                 .kind(acp::ToolKind::Other)
                 .status(acp::ToolCallStatus::Pending)
                 .content(vec![])
-                .raw_input(Some(serde_json::json!(
-                    { "task_ids" : ["sub-id-42"], "timeout_ms" : 10_000, }
-                )))
+                .raw_input(Some(serde_json::json!({
+                    "task_ids": ["sub-id-42"],
+                    "timeout_ms": 10_000,
+                })))
                 .locations(vec![]),
             ),
             &meta,
@@ -1304,9 +1597,10 @@ mod resolve_turn_activity_tests {
                     .kind(acp::ToolKind::Other)
                     .status(acp::ToolCallStatus::Pending)
                     .content(vec![])
-                    .raw_input(Some(serde_json::json!(
-                        { "task_ids" : ["bg-3"], "timeout_ms" : 5_000, }
-                    )))
+                    .raw_input(Some(serde_json::json!({
+                        "task_ids": ["bg-3"],
+                        "timeout_ms": 5_000,
+                    })))
                     .locations(vec![]),
             ),
             &meta,
@@ -1364,5 +1658,165 @@ mod status_window_tests {
             Ok("pre-replay answer".into())
         ));
         assert!(agent.btw_state.is_none());
+    }
+}
+#[cfg(test)]
+mod reconnect_workflow_maps_tests {
+    use super::super::test_agent_view;
+    use crate::views::workflows::WorkflowRunSnapshot;
+    fn wf_snapshot(run_id: &str, status: &str) -> WorkflowRunSnapshot {
+        WorkflowRunSnapshot {
+            run_id: run_id.to_string(),
+            name: "deep-research".to_string(),
+            objective: "obj".to_string(),
+            status: status.to_string(),
+            management_available: true,
+            builtin: false,
+            phases: Vec::new(),
+            current_phase: None,
+            agents: Vec::new(),
+            agent_budget: None,
+            agents_used: 0,
+            agents_reserved: 0,
+            agents_remaining: None,
+            agent_usage_incomplete: false,
+            active_agents: 0,
+            elapsed_ms: 1_000,
+            received_at: std::time::Instant::now(),
+            pause_message: None,
+            result_summary: None,
+        }
+    }
+    #[test]
+    fn cursor_reconnect_restores_stashed_workflow_run_maps() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.workflow_runs.push(wf_snapshot("wf-1", "active"));
+        agent.workflow_run_revisions.insert("wf-1".to_string(), 4);
+        agent.cleared_workflow_runs.insert("wf-old".to_string());
+        agent.begin_session_reload(1);
+        assert!(
+            agent.workflow_runs.is_empty()
+                && agent.workflow_run_revisions.is_empty()
+                && agent.cleared_workflow_runs.is_empty(),
+            "staging starts empty for all three maps"
+        );
+        assert!(agent.finish_session_reload(1, true));
+        assert_eq!(
+            agent.workflow_runs.len(),
+            1,
+            "run list must be restored from the stash on cursor reconnect"
+        );
+        assert_eq!(agent.workflow_runs[0].run_id, "wf-1");
+        assert_eq!(agent.workflow_runs[0].status, "active");
+        assert_eq!(
+            agent.workflow_run_revisions.get("wf-1").copied(),
+            Some(4),
+            "revision highwater must survive so stale re-deliveries still dedupe"
+        );
+        assert!(
+            agent.cleared_workflow_runs.contains("wf-old"),
+            "clear tombstones must survive cursor reconnect"
+        );
+    }
+    #[test]
+    fn cursor_reconnect_prefers_live_workflow_maps_over_stash() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.workflow_runs.push(wf_snapshot("wf-1", "active"));
+        agent
+            .workflow_runs
+            .push(wf_snapshot("wf-stash-only", "active"));
+        agent.workflow_run_revisions.insert("wf-1".to_string(), 3);
+        agent
+            .workflow_run_revisions
+            .insert("wf-stash-only".to_string(), 1);
+        agent.cleared_workflow_runs.insert("wf-old".to_string());
+        agent.begin_session_reload(1);
+        agent.workflow_runs.push(wf_snapshot("wf-1", "complete"));
+        agent
+            .workflow_runs
+            .push(wf_snapshot("wf-live-only", "active"));
+        agent.workflow_run_revisions.insert("wf-1".to_string(), 5);
+        agent
+            .workflow_run_revisions
+            .insert("wf-live-only".to_string(), 2);
+        agent.cleared_workflow_runs.insert("wf-new".to_string());
+        assert!(agent.finish_session_reload(1, true));
+        let by_id: std::collections::HashMap<_, _> = agent
+            .workflow_runs
+            .iter()
+            .map(|r| (r.run_id.as_str(), r.status.as_str()))
+            .collect();
+        assert_eq!(
+            by_id.get("wf-1").copied(),
+            Some("complete"),
+            "live staging snapshot wins for a shared run_id"
+        );
+        assert_eq!(
+            by_id.get("wf-stash-only").copied(),
+            Some("active"),
+            "stash-only runs are restored"
+        );
+        assert_eq!(
+            by_id.get("wf-live-only").copied(),
+            Some("active"),
+            "live-only runs are kept"
+        );
+        assert_eq!(
+            agent.workflow_run_revisions.get("wf-1").copied(),
+            Some(5),
+            "max revision per run_id"
+        );
+        assert_eq!(
+            agent.workflow_run_revisions.get("wf-stash-only").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            agent.workflow_run_revisions.get("wf-live-only").copied(),
+            Some(2)
+        );
+        assert!(agent.cleared_workflow_runs.contains("wf-old"));
+        assert!(agent.cleared_workflow_runs.contains("wf-new"));
+    }
+    #[test]
+    fn cursor_reconnect_does_not_resurrect_cleared_runs() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.workflow_runs.push(wf_snapshot("wf-1", "active"));
+        agent.workflow_runs.push(wf_snapshot("wf-keep", "active"));
+        agent
+            .workflow_runs
+            .push(wf_snapshot("wf-stash-survivor", "active"));
+        agent.workflow_run_revisions.insert("wf-1".to_string(), 2);
+        agent
+            .workflow_run_revisions
+            .insert("wf-keep".to_string(), 1);
+        agent
+            .workflow_run_revisions
+            .insert("wf-stash-survivor".to_string(), 1);
+        agent.begin_session_reload(1);
+        agent.workflow_runs.push(wf_snapshot("wf-keep", "complete"));
+        agent.cleared_workflow_runs.insert("wf-1".to_string());
+        assert!(agent.finish_session_reload(1, true));
+        assert!(
+            agent.workflow_runs.iter().all(|r| r.run_id != "wf-1"),
+            "cleared-during-window runs must not reappear from the stash"
+        );
+        assert!(agent.cleared_workflow_runs.contains("wf-1"));
+        assert_eq!(
+            agent
+                .workflow_runs
+                .iter()
+                .find(|r| r.run_id == "wf-stash-survivor")
+                .map(|r| r.status.as_str()),
+            Some("active"),
+            "a stash-only run not cleared during the window must be restored by the merge"
+        );
+        assert_eq!(
+            agent
+                .workflow_runs
+                .iter()
+                .find(|r| r.run_id == "wf-keep")
+                .map(|r| r.status.as_str()),
+            Some("complete")
+        );
     }
 }

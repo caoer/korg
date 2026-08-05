@@ -100,7 +100,7 @@ On startup, Grok detects your terminal's color capability level:
 
 When you set `NO_COLOR`, Grok emits no color and renders in monochrome.
 
-Run `/terminal-setup` to see the detected level (`color` row) and which themes the picker offers on this terminal (`themes` row). When truecolor is missing, the issues section explains how to enable it (or that Terminal.app cannot).
+Run `/doctor` to see the detected color level and the themes available on this terminal. If truecolor is unavailable, Doctor shows the relevant setup steps or explains the terminal limitation.
 
 ### Automatic Quantization
 
@@ -189,7 +189,7 @@ gap_right = 0           # Gap between scrollbar and screen edge (0 = at edge)
 [scrollback.scroll]
 margin = 0                  # Context lines above/below selected entry (0 = edge)
 min_page_fraction = 0       # Minimum scroll as % of viewport (0-100)
-follow_indicator = "center" # "center" = show down-arrow, "none" = hidden
+follow_indicator = "center" # "center" = show the ▼/▲ scroll arrows, "none" = hidden
 follow_auto_select = true   # Auto-select latest entry when following
 follow_by_overscroll = true # Scrolling past bottom engages follow mode
 anchor_on_fold = true       # Keep block header at same screen position when folding

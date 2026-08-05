@@ -6,6 +6,7 @@ use super::*;
 
 /// Number of output lines to show in final bash mode output summary
 const BASH_MODE_FINAL_OUTPUT_LINES: usize = 10;
+const BASH_MODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// Phase 2: dispatch a tool call through [`WorkspaceOps::call_tool`].
 ///
@@ -93,6 +94,27 @@ pub(super) fn backend_tool_display(name: &str) -> (String, acp::ToolKind, serde_
             acp::ToolKind::Other,
             serde_json::json!({"backend": true}),
         ),
+    }
+}
+
+/// Map a completed backend (server-side) tool call's payload to the ACP terminal
+/// status the shell should emit. The backend reports each call's real
+/// success/failure in the serialized payload's top-level `status` field (e.g. a
+/// `web_search_call`'s `WebSearchToolCallStatus`, which includes `failed`); a
+/// `"failed"` status becomes [`acp::ToolCallStatus::Failed`] so downstream
+/// consumers — notably the headless `streaming-messages-json`
+/// `web_search_tool_result_error` branch — see the real failure instead of a
+/// blanket `Completed`. Any other or absent status stays `Completed`
+/// (behavior-preserving for the success path).
+pub(super) fn backend_tool_call_status(result: Option<&serde_json::Value>) -> acp::ToolCallStatus {
+    let failed = result
+        .and_then(|r| r.get("status"))
+        .and_then(serde_json::Value::as_str)
+        == Some("failed");
+    if failed {
+        acp::ToolCallStatus::Failed
+    } else {
+        acp::ToolCallStatus::Completed
     }
 }
 
@@ -236,7 +258,7 @@ impl SessionActor {
             command: command.clone(),
             cwd: self.tool_context.cwd.clone(),
             env: self.tool_context.session_env.as_ref().clone(),
-            timeout: DEFAULT_TIMEOUT,
+            timeout: BASH_MODE_TIMEOUT,
             output_byte_limit: 1_048_576, // 1 MiB
             stream: true,                 // Enable streaming for bash mode
             output_file: None,            // No file logging for interactive bash mode
@@ -407,4 +429,50 @@ pub(super) fn build_tool_parse_error_message(
     }
 
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xai_grok_sampling_types::rs;
+
+    fn web_search_payload(status: rs::WebSearchToolCallStatus) -> serde_json::Value {
+        // The exact serialized `web_search_call` payload the sampler forwards on
+        // `BackendToolCallCompleted` (via `serde_json::to_value(ws)`).
+        serde_json::to_value(rs::WebSearchToolCall {
+            action: rs::WebSearchToolCallAction::Search(rs::WebSearchActionSearch {
+                query: "rust async runtime".to_string(),
+                sources: None,
+            }),
+            id: "ws1".to_string(),
+            status,
+        })
+        .expect("serialize web_search_call payload")
+    }
+
+    /// A backend-reported web-search failure must map to ACP `Failed` (so the
+    /// headless `web_search_tool_result_error` branch becomes reachable in
+    /// production), while a completed call — or an absent payload — stays
+    /// `Completed`. Exercises the real payload shape, not a hand-built status.
+    #[test]
+    fn backend_failed_web_search_maps_to_failed_status() {
+        let failed = web_search_payload(rs::WebSearchToolCallStatus::Failed);
+        assert_eq!(failed["status"], "failed", "wire field name is `status`");
+        assert_eq!(
+            backend_tool_call_status(Some(&failed)),
+            acp::ToolCallStatus::Failed
+        );
+
+        let completed = web_search_payload(rs::WebSearchToolCallStatus::Completed);
+        assert_eq!(
+            backend_tool_call_status(Some(&completed)),
+            acp::ToolCallStatus::Completed
+        );
+
+        // No payload at all is treated as success (behavior-preserving).
+        assert_eq!(
+            backend_tool_call_status(None),
+            acp::ToolCallStatus::Completed
+        );
+    }
 }

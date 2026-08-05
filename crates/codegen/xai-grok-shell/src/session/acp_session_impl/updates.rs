@@ -120,10 +120,11 @@ impl SessionActor {
         let agent_timestamp_ms =
             agent_timestamp_ms_override.unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
         let (update_type, update_params) = Self::extract_update_info(&update);
-        let mut meta = json!(
-            { "totalTokens" : total_tokens, "eventId" : event_id, "agentTimestampMs" :
-            agent_timestamp_ms, }
-        );
+        let mut meta = json!({
+            "totalTokens": total_tokens,
+            "eventId": event_id,
+            "agentTimestampMs": agent_timestamp_ms,
+        });
         let obj = meta
             .as_object_mut()
             .expect("json! literal is always an Object");
@@ -239,8 +240,10 @@ impl SessionActor {
             return;
         }
         tracing::info!(
-            target : "acp_event", event = "xai_buffered_notification_sent", session_id =
-            % self.session_info.id, "Sending buffered xAI session notification"
+            target: "acp_event",
+            event = "xai_buffered_notification_sent",
+            session_id = %self.session_info.id,
+            "Sending buffered xAI session notification"
         );
     }
     fn log_outbound_notification(&self, notification: &acp::SessionNotification) {
@@ -261,9 +264,13 @@ impl SessionActor {
             .and_then(|m| m.get("chunkIndex"))
             .and_then(|v| v.as_u64());
         tracing::info!(
-            target : "acp_event", event = "agent_message_sent", event_id = % event_id,
-            session_id = % self.session_info.id, agent_timestamp_ms = agent_timestamp_ms,
-            update_type = % update_type, chunk_index = ? chunk_index,
+            target: "acp_event",
+            event = "agent_message_sent",
+            event_id = %event_id,
+            session_id = %self.session_info.id,
+            agent_timestamp_ms = agent_timestamp_ms,
+            update_type = %update_type,
+            chunk_index = ?chunk_index,
             "Sending session update"
         );
     }
@@ -348,31 +355,37 @@ impl SessionActor {
             }
             acp::SessionUpdate::ToolCall(tool_call) => (
                 Some("ToolCall".to_string()),
-                Some(json!(
-                    { "toolCallId" : tool_call.tool_call_id.0, "title" :
-                    tool_call.title, "kind" : format!("{:?}", tool_call.kind),
-                    "status" : format!("{:?}", tool_call.status), }
-                )),
+                Some(json!({
+                    "toolCallId": tool_call.tool_call_id.0,
+                    "title": tool_call.title,
+                    "kind": format!("{:?}", tool_call.kind),
+                    "status": format!("{:?}", tool_call.status),
+                })),
             ),
             acp::SessionUpdate::ToolCallUpdate(tool_update) => (
                 Some("ToolCallUpdate".to_string()),
-                Some(json!(
-                    { "toolCallId" : tool_update.tool_call_id.0, "status" :
-                    tool_update.fields.status.as_ref().map(| s | format!("{:?}",
-                    s)), }
-                )),
+                Some(json!({
+                    "toolCallId": tool_update.tool_call_id.0,
+                    "status": tool_update.fields.status.as_ref().map(|s| format!("{:?}", s)),
+                })),
             ),
             acp::SessionUpdate::Plan(plan) => (
                 Some("Plan".to_string()),
-                Some(json!({ "planSteps" : plan.entries.len(), })),
+                Some(json!({
+                    "planSteps": plan.entries.len(),
+                })),
             ),
             acp::SessionUpdate::AvailableCommandsUpdate(update) => (
                 Some("AvailableCommandsUpdate".to_string()),
-                Some(json!({ "commandsCount" : update.available_commands.len(), })),
+                Some(json!({
+                    "commandsCount": update.available_commands.len(),
+                })),
             ),
             acp::SessionUpdate::CurrentModeUpdate(update) => (
                 Some("CurrentModeUpdate".to_string()),
-                Some(json!({ "currentModeId" : update.current_mode_id, })),
+                Some(json!({
+                    "currentModeId": update.current_mode_id,
+                })),
             ),
             _ => (None, None),
         }
@@ -387,7 +400,10 @@ impl SessionActor {
     pub(super) fn build_notification_meta(&self) -> serde_json::Value {
         let event_id = self.generate_event_id();
         let agent_timestamp_ms = chrono::Utc::now().timestamp_millis();
-        json!({ "eventId" : event_id, "agentTimestampMs" : agent_timestamp_ms, })
+        json!({
+            "eventId": event_id,
+            "agentTimestampMs": agent_timestamp_ms,
+        })
     }
     /// Handle xAI session notifications - store them in persistence
     /// These are client-side events (like diff reviews) that should be part of session history.
@@ -435,7 +451,8 @@ impl SessionActor {
                             Some(r) => r.last_cumulative_reported,
                             None => {
                                 tracing::debug!(
-                                    parent_id = % pid, subagent_id = % subagent_id,
+                                    parent_id = %pid,
+                                    subagent_id = %subagent_id,
                                     "resume parent not in token registry; anchoring at 0"
                                 );
                                 0
@@ -457,10 +474,12 @@ impl SessionActor {
                         },
                     );
                 }
-                let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
                 if self.goal_harness_enabled() {
-                    self.drain_goal_updates(current_tokens, DrainPurpose::MidTurn)
-                        .await;
+                    let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
+                    if !self.goal_runs_on_workflow_engine() {
+                        self.drain_goal_updates(current_tokens, DrainPurpose::MidTurn)
+                            .await;
+                    }
                     let (tokens_used, finished_marginal) = self.goal_tokens(current_tokens);
                     let notify = self.goal_notify_sender();
                     notify.emit_goal_updated(
@@ -552,7 +571,7 @@ impl SessionActor {
                         Some(_) => None,
                         None => {
                             tracing::debug!(
-                                subagent_id = % subagent_id,
+                                subagent_id = %subagent_id,
                                 "progress tick for unregistered subagent; dropped"
                             );
                             None
@@ -656,6 +675,38 @@ impl SessionActor {
     pub(super) async fn send_xai_notification(&self, update: XaiSessionUpdate) {
         self.send_xai_notification_with_extra_meta(update, None)
             .await;
+    }
+    /// Build the per-response boundary update, projecting the response's usage
+    /// into the Messages API `message.usage` shape (uncached `input_tokens`).
+    pub(super) fn response_completed_update(
+        &self,
+        response: &xai_grok_sampling_types::ConversationResponse,
+    ) -> XaiSessionUpdate {
+        let usage =
+            response
+                .usage
+                .as_ref()
+                .map(|u| crate::extensions::notification::ResponseUsage {
+                    input_tokens: u64::from(
+                        u.prompt_tokens
+                            .saturating_sub(u.cached_prompt_tokens)
+                            .saturating_sub(u.cache_creation_prompt_tokens),
+                    ),
+                    output_tokens: u64::from(u.completion_tokens),
+                    cache_read_input_tokens: u64::from(u.cached_prompt_tokens),
+                    cache_creation_input_tokens: u64::from(u.cache_creation_prompt_tokens),
+                    reasoning_tokens: u64::from(u.reasoning_tokens),
+                });
+        let signature = response
+            .reasoning_items()
+            .find_map(|r| r.encrypted_content.clone());
+        XaiSessionUpdate::ResponseCompleted {
+            message_id: response.message_id.clone(),
+            stop_reason: response.raw_stop_reason.clone(),
+            usage,
+            signature,
+            stop_sequence: response.stop_sequence.clone(),
+        }
     }
     /// [`Self::send_xai_notification`] with caller-supplied `_meta` keys merged
     /// into the standard eventId/timestamp meta. Caller keys win on collision.

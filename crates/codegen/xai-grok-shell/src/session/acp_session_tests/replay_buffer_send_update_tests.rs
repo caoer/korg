@@ -65,6 +65,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
+        combine_edit_holds: std::collections::HashSet::new(),
         pending_notifications: Vec::new(),
         notifications_suppressed: false,
         rewindable: false,
@@ -77,9 +78,10 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             cwd: cwd.as_str().to_string(),
         },
         auth_method_id: test_auth_method_id("test-auth"),
-        model_auth_facts: std::cell::RefCell::new(None),
+        model_auth_memo: std::cell::RefCell::new(None),
         attribution_callback: None,
         auth_manager: None,
+        is_chat_kind: false,
         state,
         notifications: NotificationSender {
             gateway,
@@ -92,12 +94,15 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         mcp_state: Arc::new(TokioMutex::new(McpState::new(vec![]))),
         mcp_strategy: McpInitStrategy::Blocking,
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
+        unattributed_background_usage: std::sync::atomic::AtomicBool::new(false),
         current_prompt_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
         telemetry_enabled: false,
         supports_backend_search: std::cell::Cell::new(false),
+        tool_overrides: std::cell::RefCell::new(None),
+        resolved_tool_overrides: std::sync::Arc::new(arc_swap::ArcSwapOption::empty()),
         compactions_remaining: std::cell::Cell::new(None),
         compaction_at_tokens: std::cell::Cell::new(None),
         doom_loop_recovery: None,
@@ -118,6 +123,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             tool_choice: crate::util::config::CompactionToolChoice::Auto,
             prefire: crate::session::compaction_config::PrefireState::default(),
             prefix_released: std::sync::atomic::AtomicBool::new(false),
+            cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
             flush_config: crate::config::MemoryFlushConfig::default(),
@@ -178,6 +184,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             )),
         )),
         goal_enabled: false,
+        background_workflows_enabled: false,
         goal_harness_enabled: std::sync::atomic::AtomicBool::new(false),
         goal_harness_availability_reconciled: std::sync::atomic::AtomicBool::new(false),
         goal_tracker: Arc::new(parking_lot::Mutex::new(
@@ -188,8 +195,10 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         goal_turn_task_ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
         goal_continuation_streak: std::sync::atomic::AtomicU32::new(0),
         goal_blocked_streak: std::sync::atomic::AtomicU32::new(0),
-        goal_update_rx: std::cell::RefCell::new(Some(tokio::sync::mpsc::unbounded_channel().1)),
+        goal_update_rx: std::cell::RefCell::new(None),
         goal_update_tx: tokio::sync::mpsc::unbounded_channel().0,
+        workflow_manager: crate::session::workflow::manager::WorkflowManager::test_bundle().0,
+        workflow_launch_tx: tokio::sync::mpsc::unbounded_channel().0,
         goal_classifier_enabled: false,
         goal_planner_enabled: false,
         goal_summary_enabled: false,
@@ -200,7 +209,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         goal_strategist_every: 5,
         goal_reverify_after: crate::session::acp_session::GOAL_REVERIFY_AFTER_DEFAULT,
         goal_plan_reconciled: std::sync::atomic::AtomicBool::new(false),
-        pending_classifier_completions: parking_lot::Mutex::new(VecDeque::new()),
+        pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
         managed_mcp_expires_at: std::sync::Mutex::new(None),
@@ -216,6 +225,7 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
         deferred_prefix: TaskSlot::new(),
         extension_registry: xai_agent_lifecycle::LocalExtensionRegistry::default(),
         last_announced_local_date: std::cell::Cell::new(chrono::Local::now().date_naive()),
+        prefix_carries_fallback_date: std::cell::Cell::new(false),
         last_search_prompt_index: std::sync::atomic::AtomicI64::new(-1),
         last_api_request_at: std::sync::atomic::AtomicI64::new(0),
         hook_registry: std::cell::RefCell::new(None),
@@ -437,7 +447,8 @@ async fn available_commands_update_is_forwarded_but_not_persisted() {
                 tokio::task::yield_now().await;
             }
             assert_eq!(
-                sent.lock(). await .len(), 2,
+                sent.lock().await.len(),
+                2,
                 "both updates must be forwarded to the live client (command palette must stay current)",
             );
             let mut persisted = vec![];
@@ -449,7 +460,8 @@ async fn available_commands_update_is_forwarded_but_not_persisted() {
                 }
             }
             assert_eq!(
-                persisted.len(), 1,
+                persisted.len(),
+                1,
                 "exactly one update must be persisted; available_commands_update must be skipped",
             );
             assert!(
@@ -654,6 +666,9 @@ async fn completed_event_clears_slot_keeps_prior_uncommitted_segments() {
                         message_chunks_emitted: 0,
                         doom_loop_signals: Vec::new(),
                         stop_message: None,
+                        message_id: None,
+                        raw_stop_reason: None,
+                        stop_sequence: None,
                     }),
                     metrics: InferenceLatencyStats::default(),
                 })
@@ -729,6 +744,9 @@ async fn completed_event_releases_stream_drain_barrier() {
                         message_chunks_emitted: 1,
                         doom_loop_signals: Vec::new(),
                         stop_message: None,
+                        message_id: None,
+                        raw_stop_reason: None,
+                        stop_sequence: None,
                     }),
                     metrics: InferenceLatencyStats::default(),
                 })
@@ -787,10 +805,12 @@ async fn failed_event_preserves_streaming_capture_for_takeout() {
                         message: "max output tokens reached".to_string(),
                         is_retryable: false,
                         retry_after_secs: None,
+                        should_retry: None,
                         model_metadata: None,
                         empty_response_context: None,
                         doom_loop_triggers: None,
                         doom_loop_aborted_at_chunk: None,
+                        credential: xai_grok_sampling_types::SentCredential::Unknown,
                     },
                 })
                 .await;
@@ -861,6 +881,9 @@ async fn observe_only_confident_completion_stays_warn_only() {
                     "tail_repetition:8@thinking",
                 )],
                 stop_message: None,
+                message_id: None,
+                raw_stop_reason: None,
+                stop_sequence: None,
             };
             actor
                 .handle_sampling_event(SamplingEvent::Completed {
@@ -961,6 +984,9 @@ async fn doom_loop_recovery_stamps_capture_segments_and_counters() {
                     "tail_repetition:4@thinking",
                 )],
                 stop_message: None,
+                message_id: None,
+                raw_stop_reason: None,
+                stop_sequence: None,
             };
             actor
                 .handle_sampling_event(SamplingEvent::Completed {
@@ -1191,6 +1217,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 message: "empty response from model (reasoning_only)".to_string(),
                 is_retryable: false,
                 retry_after_secs: None,
+                should_retry: None,
                 model_metadata: None,
                 empty_response_context: Some(EmptyResponseContext {
                     reason: EmptyReason::ReasoningOnly,
@@ -1206,6 +1233,7 @@ async fn reasoning_only_doomloop_turn_captures_every_generation_as_segments() {
                 }),
                 doom_loop_triggers: None,
                 doom_loop_aborted_at_chunk: None,
+                credential: xai_grok_sampling_types::SentCredential::Unknown,
             };
             actor
                 .handle_sampling_event(SamplingEvent::Failed {

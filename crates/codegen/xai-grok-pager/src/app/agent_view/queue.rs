@@ -3,8 +3,8 @@
 
 #[cfg(test)]
 use super::test_fixtures;
-use super::{AgentPane, AgentView, ParkedMarkerSlot, PromptMode, overlay_action_to_outcome};
-use crate::actions::ActionRegistry;
+use super::{AgentPane, AgentView, PromptMode, overlay_action_to_outcome};
+use crate::actions::{ActionId, ActionRegistry};
 use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
 use crossterm::event::KeyEvent;
@@ -76,8 +76,8 @@ impl AgentView {
     /// the wait as user-interruptible would lie there).
     ///
     /// Gates Enter interjecting instead of queueing and the parked queue
-    /// drain. The stopped-session *rendering* additionally requires the
-    /// parked-marker slot to be consumed — see [`Self::renders_parked`].
+    /// drain. The stopped-session *rendering* additionally excludes subagent
+    /// waits — see [`Self::renders_parked`].
     /// Purely view-derived — reading it has no turn-lifecycle side effects.
     pub(crate) fn is_parked_on_sendable_wait(&self) -> bool {
         crate::views::turn_status::is_sendable_wait(&self.resolve_turn_activity())
@@ -114,7 +114,7 @@ impl AgentView {
     }
 
     /// The current wait is a foreground subagent await — sendable, but excluded
-    /// from the parked marker (the parent is blocked, not completed; the
+    /// from the parked look (the parent is blocked, not completed; the
     /// subagent reports its own progress).
     pub(crate) fn is_waiting_on_subagent(&self) -> bool {
         use crate::acp::tracker::{TurnActivity, WaitingReason};
@@ -122,166 +122,6 @@ impl AgentView {
             self.resolve_turn_activity(),
             Some(TurnActivity::Waiting(WaitingReason::Subagent))
         )
-    }
-
-    /// The wait can only return imminently: every awaited id is already
-    /// terminal, or a wait-all sees zero running work. Unknown ids and Sleep
-    /// are never imminent. Callers must pre-gate on
-    /// `is_parked_on_sendable_wait` — this predicate ignores `waits`.
-    fn parked_wait_resolves_imminently(&self) -> bool {
-        use crate::acp::tracker::{TurnActivity, WaitingReason};
-        match self.resolve_turn_activity() {
-            Some(TurnActivity::Waiting(WaitingReason::TaskOutput { task_ids, .. })) => {
-                !task_ids.is_empty() && task_ids.iter().all(|id| self.awaited_id_is_terminal(id))
-            }
-            // The tracker drops wait_commands_or_subagents' explicit task_ids;
-            // zero visible work is the only signal available here.
-            Some(TurnActivity::Waiting(WaitingReason::TasksComplete)) => {
-                self.watchers().awaitable_work() == 0
-            }
-            _ => false,
-        }
-    }
-
-    /// Terminal work behind an awaited id: bg task by task id, else subagent
-    /// by child session id or subagent id. Unknown → `false`.
-    fn awaited_id_is_terminal(&self, id: &str) -> bool {
-        if let Some(task) = self.session.bg_tasks.get(id) {
-            return task.status != crate::app::agent::BgTaskStatus::Running;
-        }
-        self.subagent_sessions
-            .get(id)
-            .or_else(|| {
-                self.subagent_sessions
-                    .values()
-                    .find(|info| info.subagent_id.as_ref() == id)
-            })
-            .is_some_and(|info| !info.is_running())
-    }
-
-    /// Push a "Worked for X" marker when the turn parks on a sendable wait —
-    /// the transcript boundary explaining the idle-looking chrome. One marker
-    /// per park episode: same agent-output epoch as the rendered slot means
-    /// no re-push (chips/completions don't bump it); an epoch bump means the
-    /// wait resumed and re-parked, which pushes a fresh marker. Completion
-    /// rails also call this to re-eval a park withheld at park time (e.g.
-    /// held queue since drained).
-    ///
-    /// Called from the ACP notification path — not the draw path — so
-    /// background tabs and minimal mode stamp the park at its true moment;
-    /// each push is append-only (minimal mode commits print-once). A
-    /// [`ParkedMarkerSlot::Forgone`] slot stays silent for the rest of the
-    /// turn (see [`Self::suppress_parked_marker_on_interject`]). UI-only: no
-    /// turn-lifecycle event, no stop hooks; the real completion prints its
-    /// own marker.
-    pub(crate) fn maybe_push_parked_marker(&mut self) {
-        if !self.is_parked_on_sendable_wait()
-            || self.is_waiting_on_subagent()
-            || self.has_held_user_queue()
-        {
-            return;
-        }
-        let Some(prompt_id) = self.session.current_prompt_id.clone() else {
-            return;
-        };
-        match &self.parked_wait_marker_for {
-            // Interjection ordering: forgone is final for the turn.
-            Some(ParkedMarkerSlot::Forgone(pid)) if *pid == prompt_id => return,
-            // Same park episode (no parent output since the marker): the one
-            // marker already explains this park — chips landing below it
-            // must not re-push.
-            Some(ParkedMarkerSlot::Rendered {
-                prompt_id: pid,
-                agent_output_epoch,
-                ..
-            }) if *pid == prompt_id
-                && *agent_output_epoch == self.session.tracker.agent_output_epoch() =>
-            {
-                return;
-            }
-            // A tail user prompt after a rendered marker is an interjection:
-            // a marker line beneath it would flip the transcript.
-            Some(ParkedMarkerSlot::Rendered { prompt_id: pid, .. })
-                if *pid == prompt_id && self.tail_is_user_prompt() =>
-            {
-                return;
-            }
-            _ => {}
-        }
-        // Below the slot dedupe: a rendered park would otherwise log a false
-        // "skipped" on every subsequent update.
-        if self.parked_wait_resolves_imminently() {
-            tracing::debug!(
-                target: "prompt.parked_marker",
-                "parked marker skipped: awaited work already finished, wait resolves imminently"
-            );
-            return;
-        }
-        self.push_parked_marker_block(prompt_id);
-    }
-
-    /// The transcript tail is a user-authored prompt row.
-    fn tail_is_user_prompt(&self) -> bool {
-        matches!(
-            self.scrollback.last().map(|entry| &entry.block),
-            Some(crate::scrollback::block::RenderBlock::UserPrompt(_))
-        )
-    }
-
-    /// The parked marker block shape: a `TurnCompleted` marker flagged
-    /// `parked` (renders mid-turn, never accepts stop hooks).
-    fn push_parked_marker_block(&mut self, prompt_id: String) {
-        let agent_output_epoch = self.session.tracker.agent_output_epoch();
-        let mut block = crate::scrollback::blocks::SessionEventBlock::new(
-            crate::scrollback::blocks::SessionEvent::TurnCompleted {
-                // Unknown elapsed renders as "Worked for 0.0s" rather than
-                // falling back to `None`'s bare "Turn completed." — the park
-                // boundary should read like every other turn marker.
-                elapsed: Some(self.turn_elapsed().unwrap_or_default()),
-            },
-        );
-        block.parked = true;
-        block.prompt_id = Some(prompt_id.clone());
-        self.scrollback
-            .push_block(crate::scrollback::block::RenderBlock::SessionEvent(block));
-        self.parked_wait_marker_for = Some(ParkedMarkerSlot::Rendered {
-            prompt_id,
-            agent_output_epoch,
-        });
-    }
-
-    /// Consume the parked-marker slot as forgone when an interjection lands
-    /// while the turn is parked on a sendable wait: the turn visibly continues
-    /// below the user's message, so the withheld "Worked for … still
-    /// running." marker must never render under it (it would read as the turn
-    /// completing *after* the user's follow-up — flipped ordering). A no-op
-    /// when the marker already rendered (slot already stamped) or the turn is
-    /// not parked (a plain mid-turn interjection keeps a later park's marker).
-    ///
-    /// Accepted edge: if the interject send later FAILS while the wait is
-    /// still parked (`TaskResult::InterjectFailed` requeues the payload), the
-    /// slot stays consumed — idle chrome without a marker until the wait
-    /// ends. Un-consuming would recreate the flipped ordering under the
-    /// already-rendered optimistic block.
-    pub(crate) fn suppress_parked_marker_on_interject(&mut self) {
-        if self.is_parked_on_sendable_wait()
-            && let Some(prompt_id) = self.session.current_prompt_id.clone()
-        {
-            // Never downgrade a Rendered slot: with the marker on screen the
-            // ordering is already correct, and its countdown may keep ticking.
-            if self
-                .parked_wait_marker_for
-                .as_ref()
-                .is_some_and(|slot| slot.prompt_id() == prompt_id)
-            {
-                return;
-            }
-            tracing::debug!(
-                target: "prompt.auto_interject",
-                "parked marker forgone: interjection continued the parked turn"
-            );
-            self.parked_wait_marker_for = Some(ParkedMarkerSlot::Forgone(prompt_id));
-        }
     }
 
     /// Visible held rows for the "N queued" hint. 0 outside sendable waits.
@@ -369,20 +209,13 @@ impl AgentView {
         );
     }
 
-    /// Whether the stopped-session look is active: the parked-marker slot for
-    /// the current turn was consumed (marker pushed, or forgone because an
-    /// interjection continued the parked turn) and the turn is still in its
-    /// sendable wait. Drives hiding the turn-status row and the idle keybar;
-    /// flips back off (the running chrome returns) the moment the wait ends
-    /// and the turn resumes.
+    /// Whether the stopped-session look is active: the turn is parked in a
+    /// sendable wait that is not a foreground subagent await. Purely
+    /// view-derived — no transcript row is written for a park. Drives the
+    /// idle keybar and the parked turn-status cue; flips back off (the
+    /// running chrome returns) the moment the wait ends and the turn resumes.
     pub(crate) fn renders_parked(&self) -> bool {
-        self.parked_wait_marker_for
-            .as_ref()
-            .zip(self.session.current_prompt_id.as_deref())
-            .is_some_and(|(slot, pid)| slot.prompt_id() == pid)
-            && self.is_parked_on_sendable_wait()
-            // Subagent waits keep running chrome — exclude them from the stopped look.
-            && !self.is_waiting_on_subagent()
+        self.is_parked_on_sendable_wait() && !self.is_waiting_on_subagent()
     }
 
     /// Live counts for the turn-status watching cue; see
@@ -405,7 +238,12 @@ impl AgentView {
         watchers.subagents = self
             .subagent_sessions
             .values()
-            .filter(|s| s.is_running())
+            .filter(|s| s.is_running() && s.workflow_run_id.is_none())
+            .count();
+        watchers.workflows = self
+            .workflow_runs
+            .iter()
+            .filter(|run| run.is_active())
             .count();
         watchers
     }
@@ -664,10 +502,6 @@ impl AgentView {
                             if self.visible_queue_is_empty() {
                                 self.hide_queue_pane();
                             }
-                            // Deleting the last held row can flip the parked
-                            // look on now (the ACP rebroadcast re-checks too,
-                            // but the optimistic remove shouldn't lag).
-                            self.maybe_push_parked_marker();
                             return InputOutcome::Action(Action::QueueRemoveShared {
                                 id: server_id,
                                 expected_version: row.version,
@@ -677,11 +511,6 @@ impl AgentView {
                     }
                     // No drain kick (cf. mouse [cancel]): queue focus is unreachable mid-edit.
                     self.remove_local_queue_row(id);
-                    // A LOCAL delete has no server rebroadcast to re-evaluate
-                    // the parked look — deleting the last held row must flip
-                    // the stopped chrome on immediately, not on the next
-                    // unrelated notification.
-                    self.maybe_push_parked_marker();
                 }
                 QueueEvent::EditSelected { id } => {
                     // Entry into editing mode lives in `queue_edit.rs`.
@@ -710,6 +539,9 @@ impl AgentView {
                     self.session.swap_prompt_down(id);
                 }
                 QueueEvent::ForceInterject { id } => {
+                    // Same InterjectPrompt chord as the prompt; surface is the
+                    // queue pane (not When::PromptFocused).
+                    crate::actions::log_shortcut_used(key, ActionId::InterjectPrompt, "queue");
                     return self.force_interject_queue_row(id);
                 }
             }
@@ -870,6 +702,7 @@ mod queue_edit_routing_tests {
             last_editor: None,
             kind: "prompt".into(),
             text: format!("server {id}"),
+            combined_texts: None,
             position,
         }
     }
@@ -1339,6 +1172,7 @@ mod queue_edit_routing_tests {
                 kind: "prompt".into(),
                 text: "first".into(),
                 position: 0,
+                combined_texts: None,
             },
             QueueEntryWire {
                 id: "p2".into(),
@@ -1348,6 +1182,7 @@ mod queue_edit_routing_tests {
                 kind: "prompt".into(),
                 text: "second".into(),
                 position: 1,
+                combined_texts: None,
             },
         ];
         agent.session.pending_prompts.clear();
@@ -1735,8 +1570,33 @@ mod queue_edit_routing_tests {
 
 #[cfg(test)]
 mod watcher_tests {
-    use super::super::test_agent_view;
+    use super::super::{test_agent_view, test_fixtures};
     use crate::views::turn_status::Watchers;
+    use crate::views::workflows::WorkflowRunSnapshot;
+
+    fn active_workflow(run_id: &str) -> WorkflowRunSnapshot {
+        WorkflowRunSnapshot {
+            run_id: run_id.to_owned(),
+            name: "workflow".to_owned(),
+            objective: "objective".to_owned(),
+            status: "active".to_owned(),
+            management_available: true,
+            builtin: false,
+            phases: Vec::new(),
+            current_phase: None,
+            agents: Vec::new(),
+            agent_budget: None,
+            agents_used: 0,
+            agents_reserved: 0,
+            agents_remaining: None,
+            agent_usage_incomplete: false,
+            active_agents: 0,
+            elapsed_ms: 0,
+            received_at: std::time::Instant::now(),
+            pause_message: None,
+            result_summary: None,
+        }
+    }
 
     fn insert_bg_task(
         agent: &mut crate::app::agent_view::AgentView,
@@ -1784,6 +1644,56 @@ mod watcher_tests {
                 monitors: 1,
                 loops: 0,
                 subagents: 0,
+                workflows: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn workflow_children_coalesce_into_one_workflow_watcher() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.workflow_runs.push(active_workflow("wf-1"));
+        let mut child_a = test_fixtures::running_subagent_info("child-a");
+        child_a.workflow_run_id = Some("wf-1".into());
+        let mut child_b = test_fixtures::running_subagent_info("child-b");
+        child_b.workflow_run_id = Some("wf-1".into());
+        agent.subagent_sessions.insert("child-a".into(), child_a);
+        agent.subagent_sessions.insert("child-b".into(), child_b);
+
+        assert_eq!(
+            agent.watchers(),
+            Watchers {
+                commands: 0,
+                monitors: 0,
+                loops: 0,
+                subagents: 0,
+                workflows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn standalone_subagent_and_workflow_remain_distinct_watchers() {
+        let mut agent = test_agent_view(Some("s1"), std::path::PathBuf::from("/tmp"));
+        agent.workflow_runs.push(active_workflow("wf-1"));
+        let mut workflow_child = test_fixtures::running_subagent_info("workflow-child");
+        workflow_child.workflow_run_id = Some("wf-1".into());
+        agent
+            .subagent_sessions
+            .insert("workflow-child".into(), workflow_child);
+        agent.subagent_sessions.insert(
+            "standalone-child".into(),
+            test_fixtures::running_subagent_info("standalone-child"),
+        );
+
+        assert_eq!(
+            agent.watchers(),
+            Watchers {
+                commands: 0,
+                monitors: 0,
+                loops: 0,
+                subagents: 1,
+                workflows: 1,
             }
         );
     }

@@ -113,8 +113,10 @@ pub async fn fetch_subagent_bundle(
     }
     let bundle: SubagentBundle = parse_json_response(response).await?;
     tracing::debug!(
-        version = % bundle.version, personas = bundle.personas.len(), roles = bundle
-        .roles.len(), agents = bundle.agents.len(),
+        version = %bundle.version,
+        personas = bundle.personas.len(),
+        roles = bundle.roles.len(),
+        agents = bundle.agents.len(),
         "Fetched subagent bundle from cli-chat-proxy"
     );
     Ok(bundle)
@@ -193,7 +195,7 @@ async fn fetch_bundle_inner(
         return Err(BackendError::RequestFailed { status: 401, body });
     }
     tracing::debug!(
-        status = % archive_response.status(),
+        status = %archive_response.status(),
         "archive endpoint unavailable, falling back to legacy JSON"
     );
     let bundle = fetch_subagent_bundle(
@@ -207,16 +209,16 @@ async fn fetch_bundle_inner(
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ShareResponse {
+pub(crate) struct ShareResponse {
     pub permission_id: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadDataResponse {
+pub(crate) struct LoadDataResponse {
     pub messages: Option<Vec<LoadedMessage>>,
     pub session: Option<SessionInfo>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadedMessage {
+pub(crate) struct LoadedMessage {
     pub id: String,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,14 +237,14 @@ pub struct SessionInfo {
     pub metadata: Option<serde_json::Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SaveDataRequest {
+pub(crate) struct SaveDataRequest {
     pub messages: Vec<ExportedMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpsertSessionRequest {
+pub(crate) struct UpsertSessionRequest {
     pub session: SessionUpdate,
     pub agent_id: String,
 }
@@ -288,11 +290,16 @@ impl Default for BackendClient {
 }
 impl BackendClient {
     fn build_default_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(DEFAULT_TIMEOUT)
+        xai_grok_extra_ca::with_extra_root_certificates(
+                reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(DEFAULT_TIMEOUT),
+            )
             .build()
-            .expect("failed to build HTTP client")
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to build backend HTTP client; falling back to shared client");
+                crate::http::shared_client()
+            })
     }
     pub fn new() -> Self {
         let reqwest_client = Self::build_default_client();
@@ -315,7 +322,10 @@ impl BackendClient {
     }
     /// Attach a live `AuthManager` so every request resolves a fresh token
     /// instead of requiring the caller to pass `&GrokAuth`.
-    pub fn with_auth_manager(mut self, manager: std::sync::Arc<crate::auth::AuthManager>) -> Self {
+    pub(crate) fn with_auth_manager(
+        mut self,
+        manager: std::sync::Arc<crate::auth::AuthManager>,
+    ) -> Self {
         let credentials: std::sync::Arc<dyn xai_grok_auth::AuthCredentialProvider> =
             std::sync::Arc::new(
                 crate::auth::credential_provider::ShellAuthCredentialProvider::new(
@@ -367,7 +377,7 @@ impl BackendClient {
             Ok(()) => {}
             Err(BackendError::RequestFailed { status: 413, .. }) => {
                 tracing::warn!(
-                    session_id = % session.session_id,
+                    session_id = %session.session_id,
                     "Backend returned 413 for save_session_data; \
                      session data should already be in GCS via signed URL"
                 );
@@ -376,22 +386,6 @@ impl BackendClient {
         }
         let share_response = self.create_share_link(&session.session_id).await?;
         Ok(share_url(&share_response.permission_id))
-    }
-    /// Sync session to backend without creating a share link.
-    pub async fn sync_session(
-        &self,
-        session: &ExportedSession,
-        agent_id: &str,
-    ) -> Result<(), BackendError> {
-        self.upsert_session(&session.session_id, &session.metadata, agent_id)
-            .await?;
-        self.save_session_data(
-            &session.session_id,
-            &session.messages,
-            Some(&session.metadata),
-        )
-        .await?;
-        Ok(())
     }
     /// Build auth + identity headers.
     /// Must include X-XAI-Token-Auth so nginx auth subrequest routes to authenticate_xai_grok_cli_token.
@@ -433,7 +427,7 @@ impl BackendClient {
     ) -> Result<reqwest::Response, BackendError> {
         let headers = self.auth_header_map().await?;
         let builder = xai_file_utils::trace_context::inject_trace_context_into_request(
-            builder.headers(headers),
+            builder.timeout(DEFAULT_TIMEOUT).headers(headers),
         );
         let request = builder.build()?;
         self.client.execute(request).await.map_err(|e| match e {
@@ -467,7 +461,7 @@ impl BackendClient {
         }
         Ok(())
     }
-    pub async fn save_session_data(
+    pub(crate) async fn save_session_data(
         &self,
         session_id: &str,
         messages: &[ExportedMessage],
@@ -504,7 +498,7 @@ impl BackendClient {
         let data: ListResponse = response.json().await?;
         Ok(data.sessions)
     }
-    pub async fn load_session_data(
+    pub(crate) async fn load_session_data(
         &self,
         session_id: &str,
     ) -> Result<LoadDataResponse, BackendError> {
@@ -523,7 +517,10 @@ impl BackendClient {
         let data: LoadDataResponse = response.json().await?;
         Ok(data)
     }
-    pub async fn create_share_link(&self, session_id: &str) -> Result<ShareResponse, BackendError> {
+    pub(crate) async fn create_share_link(
+        &self,
+        session_id: &str,
+    ) -> Result<ShareResponse, BackendError> {
         let url = format!("{}/sessions/{}/share", self.base_url, session_id);
         let response = self.send_with_auth(self.reqwest_client.post(&url)).await?;
         if !response.status().is_success() {
@@ -534,7 +531,7 @@ impl BackendClient {
         let share_response: ShareResponse = response.json().await?;
         Ok(share_response)
     }
-    pub async fn delete_session_data(&self, session_id: &str) -> Result<(), BackendError> {
+    pub(crate) async fn delete_session_data(&self, session_id: &str) -> Result<(), BackendError> {
         let url = format!("{}/sessions/{}/data", self.base_url, session_id);
         let response = self
             .send_with_auth(self.reqwest_client.delete(&url))
@@ -547,24 +544,60 @@ impl BackendClient {
         Ok(())
     }
 }
-/// Fetch remote settings from cli-chat-proxy `GET /v1/settings`.
-///
-/// This is a blocking call intended for use in the early prefetch thread
-/// (`std::thread::spawn`, no tokio runtime). Returns `None` on any error
-/// so startup is never blocked by a settings fetch failure.
-///
-/// Retries up to 2 times (3 attempts total) on transient errors (5xx,
-/// network). 4xx and parse errors are not retried.
+/// Outcome of a blocking settings fetch. Distinguishes the three cases the
+/// external-OTEL gate cares about (see [`crate::agent::mvp_agent`]).
+#[derive(Debug)]
+#[must_use]
+#[non_exhaustive]
+pub enum SettingsFetch {
+    /// Settings fetched and parsed; carries the policy that resolves the gate.
+    /// Boxed because `RemoteSettings` is large and the other variants are unit-sized.
+    Fetched(Box<crate::util::config::RemoteSettings>),
+    /// Credential unambiguously rejected (401): the remote policy will never reach
+    /// this leader, so the gate may open without waiting.
+    Rejected,
+    /// Transient/ambiguous (network, 5xx exhausted, 403/429/other 4xx, unparseable
+    /// 2xx): outcome unknown. Leave the gate closed (fail-closed), retry later.
+    Retry,
+}
+impl SettingsFetch {
+    /// For callers that only want the settings and treat every failure alike.
+    pub fn into_option(self) -> Option<crate::util::config::RemoteSettings> {
+        match self {
+            SettingsFetch::Fetched(s) => Some(*s),
+            SettingsFetch::Rejected | SettingsFetch::Retry => None,
+        }
+    }
+}
+/// Blocking settings fetch; makes up to
+/// [`crate::http::SETTINGS_FETCH_MAX_ATTEMPTS`] attempts on transient failures.
 pub fn fetch_settings_blocking(
     cli_chat_proxy_base_url: &str,
     auth: &GrokAuth,
     alpha_test_key: Option<&str>,
-) -> Option<crate::util::config::RemoteSettings> {
-    let client = crate::http::shared_blocking_client();
-    let url = format!("{}/settings", cli_chat_proxy_base_url);
-    for attempt in 0u64..3 {
+) -> SettingsFetch {
+    fetch_settings_blocking_with_attempts(
+        cli_chat_proxy_base_url,
+        auth,
+        alpha_test_key,
+        crate::http::SETTINGS_FETCH_MAX_ATTEMPTS,
+    )
+}
+/// Settings-fetch core with a caller-chosen attempt budget. Private so the
+/// attempt count stays out of the public API; tests use it to skip retry
+/// backoff on the transient-failure paths.
+fn fetch_settings_blocking_with_attempts(
+    cli_chat_proxy_base_url: &str,
+    auth: &GrokAuth,
+    alpha_test_key: Option<&str>,
+    max_attempts: u32,
+) -> SettingsFetch {
+    let client = crate::http::shared_startup_blocking_client();
+    let url = format!("{cli_chat_proxy_base_url}/settings");
+    let max_attempts = max_attempts.max(1);
+    for attempt in 0u32..max_attempts {
         if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(500 * attempt));
+            std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
         }
         let request =
             add_cli_chat_proxy_headers_blocking(client.get(&url), auth, alpha_test_key, &url);
@@ -572,11 +605,11 @@ pub fn fetch_settings_blocking(
             Ok(resp) if resp.status().is_success() => match resp.json() {
                 Ok(settings) => {
                     tracing::debug!("Fetched remote settings from cli-chat-proxy");
-                    return Some(settings);
+                    return SettingsFetch::Fetched(Box::new(settings));
                 }
                 Err(e) => {
                     tracing::warn!(attempt, "Failed to parse settings response: {e}");
-                    return None;
+                    return SettingsFetch::Retry;
                 }
             },
             Ok(resp) if resp.status().is_server_error() => {
@@ -587,9 +620,19 @@ pub fn fetch_settings_blocking(
                 );
                 continue;
             }
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                tracing::warn!(
+                    status = resp.status().as_u16(),
+                    "Settings fetch rejected (401)"
+                );
+                return SettingsFetch::Rejected;
+            }
             Ok(resp) => {
-                tracing::warn!(status = resp.status().as_u16(), "Failed to fetch settings");
-                return None;
+                tracing::warn!(
+                    status = resp.status().as_u16(),
+                    "Settings fetch failed (non-2xx)"
+                );
+                return SettingsFetch::Retry;
             }
             Err(e) => {
                 tracing::warn!(attempt, "Settings fetch network error: {e}");
@@ -597,8 +640,8 @@ pub fn fetch_settings_blocking(
             }
         }
     }
-    tracing::error!("Settings fetch failed after 3 attempts");
-    None
+    tracing::error!(max_attempts, "Settings fetch failed");
+    SettingsFetch::Retry
 }
 #[derive(Deserialize)]
 struct LoginConfigResponse {
@@ -646,9 +689,7 @@ pub async fn fetch_login_device_flow(cli_chat_proxy_base_url: &str) -> Option<bo
     };
     match resp.json::<LoginConfigResponse>().await {
         Ok(cfg) => {
-            tracing::debug!(
-                device_flow = ? cfg.device_flow, "Fetched remote login-config"
-            );
+            tracing::debug!(device_flow = ?cfg.device_flow, "Fetched remote login-config");
             cfg.device_flow
         }
         Err(e) => {
@@ -717,7 +758,7 @@ pub(crate) fn fetch_models_blocking(
     auth: Option<&GrokAuth>,
     fetch_auth: crate::agent::models::ModelFetchAuth,
 ) -> Result<FetchModelsResult, BackendError> {
-    let client = crate::http::shared_blocking_client();
+    let client = crate::http::shared_startup_blocking_client();
     let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
     let inference_base_url = endpoints.resolve_inference_base_url();
     tracing::info!("Fetching models from {}", source.url);
@@ -788,7 +829,7 @@ pub(crate) fn fetch_models_blocking(
 }
 /// Parse a single model entry from the /models-v2 response.
 /// Used by both initial model fetch and session-resume metadata refresh.
-pub fn parse_remote_model_value(
+pub(crate) fn parse_remote_model_value(
     value: &serde_json::Value,
     default_base_url: &str,
 ) -> Option<crate::agent::config::ModelEntryConfig> {
@@ -933,9 +974,9 @@ pub fn parse_remote_model_value(
                 Ok(cfg) => Some(cfg),
                 Err(e) => {
                     tracing::warn!(
-                        error = % e,
-                        "Failed to deserialize laziness_detector block from remote model; falling back to default"
-                    );
+                            error = %e,
+                            "Failed to deserialize laziness_detector block from remote model; falling back to default"
+                        );
                     None
                 }
             })
@@ -1044,7 +1085,7 @@ mod tests {
     fn get_env_keys_parses_strings_and_rejects_non_strings() {
         use crate::agent::config::EnvKeys;
         let parse = |v: serde_json::Value| {
-            let obj = serde_json::json!({ "env_key" : v });
+            let obj = serde_json::json!({ "env_key": v });
             get_env_keys(obj.as_object().unwrap(), "env_key")
         };
         assert_eq!(parse(serde_json::json!("A")), Some(EnvKeys::single("A")));
@@ -1173,6 +1214,54 @@ mod tests {
         assert_eq!(h.authorization, None, "must not send Authorization");
         assert_eq!(h.user_id, None, "must not send x-userid");
         assert_eq!(h.email, None, "must not send x-email");
+    }
+    /// Mock cli-chat-proxy serving `GET /settings` with a fixed status + body.
+    async fn start_settings_server(
+        status: StatusCode,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let app = Router::new().route(
+            "/settings",
+            get(move || {
+                let body = body.clone();
+                async move { (status, body) }
+            }),
+        );
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, handle)
+    }
+    /// `fetch_settings_blocking` maps each HTTP outcome to the [`SettingsFetch`]
+    /// variant the external-OTEL gate relies on; 401 is the only outcome that
+    /// yields `Rejected`, everything else non-2xx fails closed as `Retry`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settings_fetch_maps_status_to_outcome() {
+        let auth = GrokAuth::test_default();
+        let cases: [(StatusCode, &str, &str); 6] = [
+            (StatusCode::OK, "{}", "Fetched"),
+            (StatusCode::UNAUTHORIZED, "{}", "Rejected"),
+            (StatusCode::FORBIDDEN, "{}", "Retry"),
+            (StatusCode::TOO_MANY_REQUESTS, "{}", "Retry"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "{}", "Retry"),
+            (StatusCode::OK, "not json", "Retry"),
+        ];
+        for (status, body, expected) in cases {
+            let (base, server) = start_settings_server(status, body.to_string()).await;
+            let a = auth.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                fetch_settings_blocking_with_attempts(&base, &a, None, 1)
+            })
+            .await
+            .unwrap();
+            server.abort();
+            let got = match outcome {
+                SettingsFetch::Fetched(_) => "Fetched",
+                SettingsFetch::Rejected => "Rejected",
+                SettingsFetch::Retry => "Retry",
+            };
+            assert_eq!(got, expected, "status {status}, body {body:?}");
+        }
     }
     #[derive(Debug, Default, Clone)]
     struct SeenHeaders {
@@ -1317,10 +1406,12 @@ mod tests {
     }
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_subagent_bundle_success() {
-        let body = serde_json::json!(
-            { "version" : "bundle-v1", "personas" : { "researcher" : "persona" }, "roles"
-            : { "reviewer" : "role" }, "agents" : { "default" : "agent" } }
-        );
+        let body = serde_json::json!({
+            "version": "bundle-v1",
+            "personas": {"researcher": "persona"},
+            "roles": {"reviewer": "role"},
+            "agents": {"default": "agent"}
+        });
         let (proxy_base_url, seen_headers, server) =
             start_bundle_server(axum::http::StatusCode::OK, body).await;
         let am = test_auth_manager();
@@ -1346,9 +1437,12 @@ mod tests {
     }
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_subagent_bundle_uses_deployment_key_without_user_headers() {
-        let body = serde_json::json!(
-            { "version" : "bundle-v1", "personas" : {}, "roles" : {}, "agents" : {} }
-        );
+        let body = serde_json::json!({
+            "version": "bundle-v1",
+            "personas": {},
+            "roles": {},
+            "agents": {}
+        });
         let (proxy_base_url, seen_headers, server) =
             start_bundle_server(axum::http::StatusCode::OK, body).await;
         let am = test_auth_manager();
@@ -1368,7 +1462,7 @@ mod tests {
     async fn fetch_subagent_bundle_http_failure() {
         let (proxy_base_url, _seen_headers, server) = start_bundle_server(
             axum::http::StatusCode::UNAUTHORIZED,
-            serde_json::json!({ "error" : "unauthorized" }),
+            serde_json::json!({"error": "unauthorized"}),
         )
         .await;
         let am = test_auth_manager();
@@ -1385,7 +1479,7 @@ mod tests {
     async fn fetch_subagent_bundle_parse_failure() {
         let (proxy_base_url, _seen_headers, server) = start_bundle_server(
             axum::http::StatusCode::OK,
-            serde_json::json!({ "version" : 42 }),
+            serde_json::json!({"version": 42}),
         )
         .await;
         let am = test_auth_manager();
@@ -1397,10 +1491,12 @@ mod tests {
     }
     #[test]
     fn parse_openai_format_uses_id_field() {
-        let value = serde_json::json!(
-            { "id" : "grok-3", "object" : "model", "owned_by" : "xai", "context_window" :
-            131072 }
-        );
+        let value = serde_json::json!({
+            "id": "grok-3",
+            "object": "model",
+            "owned_by": "xai",
+            "context_window": 131072
+        });
         let result = parse_remote_model_value(&value, "https://api.x.ai/v1").unwrap();
         assert_eq!(result.model, "grok-3");
         assert_eq!(result.base_url, "https://api.x.ai/v1");
@@ -1408,10 +1504,12 @@ mod tests {
     }
     #[test]
     fn parse_model_field_takes_priority_over_id() {
-        let value = serde_json::json!(
-            { "id" : "display-key", "model" : "actual-model-id", "name" : "Display Name",
-            "context_window" : 131072 }
-        );
+        let value = serde_json::json!({
+            "id": "display-key",
+            "model": "actual-model-id",
+            "name": "Display Name",
+            "context_window": 131072
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(result.model, "actual-model-id");
         assert_eq!(result.name.as_deref(), Some("Display Name"));
@@ -1419,21 +1517,25 @@ mod tests {
     #[test]
     fn parse_reads_reasoning_effort_fields() {
         use xai_grok_sampling_types::ReasoningEffort;
-        let value = serde_json::json!(
-            { "model" : "grok-4.5", "context_window" : 1_000_000,
-            "supports_reasoning_effort" : true, "reasoning_effort" : "high" }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4.5",
+            "context_window": 1_000_000,
+            "supports_reasoning_effort": true,
+            "reasoning_effort": "high"
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(result.supports_reasoning_effort);
         assert_eq!(result.reasoning_effort, Some(ReasoningEffort::High));
-        let value = serde_json::json!(
-            { "model" : "grok-4.5", "contextWindow" : 1_000_000,
-            "supportsReasoningEffort" : true, "reasoningEffort" : "xhigh" }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4.5",
+            "contextWindow": 1_000_000,
+            "supportsReasoningEffort": true,
+            "reasoningEffort": "xhigh"
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(result.supports_reasoning_effort);
         assert_eq!(result.reasoning_effort, Some(ReasoningEffort::Xhigh));
-        let value = serde_json::json!({ "model" : "x", "context_window" : 256_000 });
+        let value = serde_json::json!({"model": "x", "context_window": 256_000});
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(!result.supports_reasoning_effort);
         assert!(result.reasoning_effort.is_none());
@@ -1441,40 +1543,47 @@ mod tests {
     #[test]
     fn parse_reads_reasoning_efforts_list() {
         use xai_grok_sampling_types::ReasoningEffort;
-        let value = serde_json::json!(
-            { "model" : "grok-4.5", "context_window" : 1_000_000, "reasoning_efforts" :
-            [{ "id" : "deep", "value" : "xhigh", "label" : "Deep" }, { "value" :
-            "quantum" }, "low",] }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4.5",
+            "context_window": 1_000_000,
+            "reasoning_efforts": [
+                { "id": "deep", "value": "xhigh", "label": "Deep" },
+                { "value": "quantum" },
+                "low",
+            ]
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(result.reasoning_efforts.len(), 2);
         assert_eq!(result.reasoning_efforts[0].id, "deep");
         assert_eq!(result.reasoning_efforts[0].value, ReasoningEffort::Xhigh);
         assert_eq!(result.reasoning_efforts[1].value, ReasoningEffort::Low);
         for value in [
-            serde_json::json!(
-                { "model" : "m", "context_window" : 256_000, "reasoningEfforts" : [{
-                "value" : "high" }] }
-            ),
-            serde_json::json!(
-                { "model" : "m", "context_window" : 256_000, "_meta" : {
-                "reasoningEfforts" : [{ "value" : "high" }] } }
-            ),
+            serde_json::json!({
+                "model": "m", "context_window": 256_000,
+                "reasoningEfforts": [{ "value": "high" }]
+            }),
+            serde_json::json!({
+                "model": "m", "context_window": 256_000,
+                "_meta": { "reasoningEfforts": [{ "value": "high" }] }
+            }),
         ] {
             let result = parse_remote_model_value(&value, "https://default.url").unwrap();
             assert_eq!(result.reasoning_efforts.len(), 1);
             assert_eq!(result.reasoning_efforts[0].value, ReasoningEffort::High);
         }
-        let value = serde_json::json!({ "model" : "x", "context_window" : 256_000 });
+        let value = serde_json::json!({"model": "x", "context_window": 256_000});
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(result.reasoning_efforts.is_empty());
     }
     #[test]
     fn parse_reads_meta_fallback_fields() {
-        let value = serde_json::json!(
-            { "_meta" : { "model" : "meta-model-id", "contextWindow" : 131072,
-            "agentType" : "concise" } }
-        );
+        let value = serde_json::json!({
+            "_meta": {
+                "model": "meta-model-id",
+                "contextWindow": 131072,
+                "agentType": "concise"
+            }
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(result.model, "meta-model-id");
         assert_eq!(
@@ -1485,9 +1594,10 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_no_laziness_detector_block_yields_default() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(
             result.laziness_detector,
@@ -1496,11 +1606,16 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_parses_camelcase_key() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" : {
-            "enabled" : true, "max_nudges_per_session" : 2, "idle_threshold_ms" : 12_000,
-            "min_confidence" : 0.75, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": {
+                "enabled": true,
+                "max_nudges_per_session": 2,
+                "idle_threshold_ms": 12_000,
+                "min_confidence": 0.75,
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         let expected = crate::agent::config::LazinessDetectorPerModelConfig {
             enabled: true,
@@ -1513,11 +1628,16 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_parses_snake_case_laziness_detector() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "laziness_detector" : {
-            "enabled" : true, "max_nudges_per_session" : 3, "idle_threshold_ms" : 8_000,
-            "min_confidence" : 0.6, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "laziness_detector": {
+                "enabled": true,
+                "max_nudges_per_session": 3,
+                "idle_threshold_ms": 8_000,
+                "min_confidence": 0.6,
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         let expected = crate::agent::config::LazinessDetectorPerModelConfig {
             enabled: true,
@@ -1530,11 +1650,18 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_parses_meta_laziness_detector() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "_meta" : {
-            "lazinessDetector" : { "enabled" : true, "max_nudges_per_session" : 1,
-            "idle_threshold_ms" : 15_000, "min_confidence" : 0.9, }, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "_meta": {
+                "lazinessDetector": {
+                    "enabled": true,
+                    "max_nudges_per_session": 1,
+                    "idle_threshold_ms": 15_000,
+                    "min_confidence": 0.9,
+                },
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         let expected = crate::agent::config::LazinessDetectorPerModelConfig {
             enabled: true,
@@ -1547,10 +1674,13 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_partial_block_uses_field_defaults() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" : {
-            "enabled" : true, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": {
+                "enabled": true,
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         let expected = crate::agent::config::LazinessDetectorPerModelConfig {
             enabled: true,
@@ -1563,10 +1693,14 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_malformed_block_falls_back_to_default() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" : {
-            "enabled" : true, "max_nudges_per_session" : "abc", }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": {
+                "enabled": true,
+                "max_nudges_per_session": "abc",
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(
             result.laziness_detector,
@@ -1575,10 +1709,11 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_non_object_value_falls_back_to_default() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" :
-            "not-an-object", }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": "not-an-object",
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(
             result.laziness_detector,
@@ -1587,11 +1722,18 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_top_level_camelcase_wins_over_snake_case() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" : {
-            "enabled" : true, "max_nudges_per_session" : 7, }, "laziness_detector" : {
-            "enabled" : false, "max_nudges_per_session" : 99, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": {
+                "enabled": true,
+                "max_nudges_per_session": 7,
+            },
+            "laziness_detector": {
+                "enabled": false,
+                "max_nudges_per_session": 99,
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         let expected = crate::agent::config::LazinessDetectorPerModelConfig {
             enabled: true,
@@ -1608,28 +1750,40 @@ mod tests {
     /// sibling `min_confidence`, `idle_threshold_ms`, etc.).
     #[test]
     fn parse_remote_model_value_parses_include_reasoning_under_camelcase_wrapper() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" : {
-            "enabled" : true, "include_reasoning" : false, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": {
+                "enabled": true,
+                "include_reasoning": false,
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(result.laziness_detector.include_reasoning, Some(false));
     }
     #[test]
     fn parse_remote_model_value_parses_include_reasoning_under_snake_case_wrapper() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "laziness_detector" : {
-            "enabled" : true, "include_reasoning" : true, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "laziness_detector": {
+                "enabled": true,
+                "include_reasoning": true,
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(result.laziness_detector.include_reasoning, Some(true));
     }
     #[test]
     fn parse_remote_model_value_omitted_include_reasoning_defaults_to_none() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" : {
-            "enabled" : true, "max_nudges_per_session" : 2, }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": {
+                "enabled": true,
+                "max_nudges_per_session": 2,
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert_eq!(
             result.laziness_detector.include_reasoning, None,
@@ -1638,12 +1792,20 @@ mod tests {
     }
     #[test]
     fn parse_remote_model_value_top_level_wins_over_meta() {
-        let value = serde_json::json!(
-            { "model" : "grok-4", "context_window" : 256_000, "lazinessDetector" : {
-            "enabled" : true, "max_nudges_per_session" : 5, }, "_meta" : {
-            "lazinessDetector" : { "enabled" : false, "max_nudges_per_session" : 99, },
-            }, }
-        );
+        let value = serde_json::json!({
+            "model": "grok-4",
+            "context_window": 256_000,
+            "lazinessDetector": {
+                "enabled": true,
+                "max_nudges_per_session": 5,
+            },
+            "_meta": {
+                "lazinessDetector": {
+                    "enabled": false,
+                    "max_nudges_per_session": 99,
+                },
+            },
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         let expected = crate::agent::config::LazinessDetectorPerModelConfig {
             enabled: true,
@@ -1656,34 +1818,40 @@ mod tests {
     }
     #[test]
     fn parse_reads_show_model_fingerprint_field() {
-        let value = serde_json::json!(
-            { "model" : "grok-build", "context_window" : 256_000,
-            "show_model_fingerprint" : true }
-        );
+        let value = serde_json::json!({
+            "model": "grok-build",
+            "context_window": 256_000,
+            "show_model_fingerprint": true
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(result.show_model_fingerprint);
-        let value = serde_json::json!(
-            { "model" : "grok-build", "contextWindow" : 256_000, "showModelFingerprint" :
-            true }
-        );
+        let value = serde_json::json!({
+            "model": "grok-build",
+            "contextWindow": 256_000,
+            "showModelFingerprint": true
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(result.show_model_fingerprint);
-        let value = serde_json::json!(
-            { "model" : "grok-build", "context_window" : 256_000, "_meta" : {
-            "showModelFingerprint" : true } }
-        );
+        let value = serde_json::json!({
+            "model": "grok-build",
+            "context_window": 256_000,
+            "_meta": { "showModelFingerprint": true }
+        });
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(result.show_model_fingerprint);
-        let value = serde_json::json!({ "model" : "x", "context_window" : 256_000 });
+        let value = serde_json::json!({"model": "x", "context_window": 256_000});
         let result = parse_remote_model_value(&value, "https://default.url").unwrap();
         assert!(!result.show_model_fingerprint);
     }
     #[test]
     fn get_object_returns_none_for_non_object_values() {
-        let value = serde_json::json!(
-            { "string" : "hello", "number" : 42, "bool" : true, "array" : [1, 2, 3],
-            "null" : null, }
-        );
+        let value = serde_json::json!({
+            "string": "hello",
+            "number": 42,
+            "bool": true,
+            "array": [1, 2, 3],
+            "null": null,
+        });
         let obj = value.as_object().unwrap();
         assert!(get_object(obj, "string").is_none());
         assert!(get_object(obj, "number").is_none());
@@ -1694,7 +1862,9 @@ mod tests {
     }
     #[test]
     fn get_object_returns_some_for_actual_object() {
-        let value = serde_json::json!({ "nested" : { "a" : 1, "b" : "two" }, });
+        let value = serde_json::json!({
+            "nested": { "a": 1, "b": "two" },
+        });
         let obj = value.as_object().unwrap();
         let nested = get_object(obj, "nested").expect("nested key should resolve to object");
         assert!(nested.is_object());
@@ -1893,9 +2063,9 @@ mod tests {
             archive_status: StatusCode::OK,
             archive_bytes: archive_bytes.clone(),
             legacy_status: StatusCode::OK,
-            legacy_body: serde_json::json!(
-                { "version" : "v1", "personas" : {}, "roles" : {}, "agents" : {} }
-            ),
+            legacy_body: serde_json::json!({
+                "version": "v1", "personas": {}, "roles": {}, "agents": {}
+            }),
         })
         .await;
         let am = test_auth_manager();
@@ -1914,10 +2084,12 @@ mod tests {
             archive_status: StatusCode::NOT_FOUND,
             archive_bytes: Vec::new(),
             legacy_status: StatusCode::OK,
-            legacy_body: serde_json::json!(
-                { "version" : "v1", "personas" : { "r" : "p" }, "roles" : {},
-                "agents" : {} }
-            ),
+            legacy_body: serde_json::json!({
+                "version": "v1",
+                "personas": {"r": "p"},
+                "roles": {},
+                "agents": {}
+            }),
         })
         .await;
         let am = test_auth_manager();
@@ -1939,9 +2111,9 @@ mod tests {
             archive_status: StatusCode::SERVICE_UNAVAILABLE,
             archive_bytes: Vec::new(),
             legacy_status: StatusCode::OK,
-            legacy_body: serde_json::json!(
-                { "version" : "v1", "personas" : {}, "roles" : {}, "agents" : {} }
-            ),
+            legacy_body: serde_json::json!({
+                "version": "v1", "personas": {}, "roles": {}, "agents": {}
+            }),
         })
         .await;
         let am = test_auth_manager();
@@ -1994,7 +2166,7 @@ mod tests {
             archive_status: StatusCode::NOT_FOUND,
             archive_bytes: Vec::new(),
             legacy_status: StatusCode::UNAUTHORIZED,
-            legacy_body: serde_json::json!({ "error" : "unauthorized" }),
+            legacy_body: serde_json::json!({"error": "unauthorized"}),
         })
         .await;
         let am = test_auth_manager();
@@ -2020,7 +2192,7 @@ mod tests {
         );
         let request = reqwest::Client::new()
             .put("http://localhost/sessions/test")
-            .json(&serde_json::json!({ "test" : true }))
+            .json(&serde_json::json!({"test": true}))
             .headers(auth_headers)
             .build()
             .unwrap();

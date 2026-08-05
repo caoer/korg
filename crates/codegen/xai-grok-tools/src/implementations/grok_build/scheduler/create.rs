@@ -3,12 +3,12 @@ use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::tool::{ToolKind, ToolNamespace};
 
 use super::interval::{interval_to_human, parse_interval};
-use super::types::{ScheduledTask, SchedulerCommand, SchedulerHandle};
+use super::types::{ScheduledTask, SchedulerCommand, SchedulerHandle, scheduler_tool_error};
 
 // Canonical /loop wording lives in the light API crate so other consumers can
 // link it without the tools implementation crate; re-exported to keep paths stable.
 pub use xai_grok_tools_api::slash_commands::{
-    SCHEDULER_CREATE_TOOL_NAME, loop_schedule_instruction, loop_usage_message,
+    LoopFireMode, SCHEDULER_CREATE_TOOL_NAME, loop_schedule_instruction, loop_usage_message,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -143,7 +143,7 @@ impl xai_tool_runtime::Tool for SchedulerCreateTool {
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
             "scheduler_create",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -200,7 +200,7 @@ impl xai_tool_runtime::Tool for SchedulerCreateTool {
                         "Scheduler actor dropped reply",
                     )
                 })?
-                .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))
+                .map_err(scheduler_tool_error)
         };
 
         if let Some(task_id) = input.task_id {
@@ -294,9 +294,15 @@ mod tests {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let actor = SchedulerActor {
             resources: shared.clone(),
+            resources_persistence: std::sync::Arc::new(
+                crate::persistence::ResourcesPersistence::noop(),
+            ),
             notification_handle: notif_handle,
             cmd_rx,
             cancel_token: cancel_token.clone(),
+            clock: Default::default(),
+            pending_removal: None,
+            blocked_expiries: Default::default(),
         };
         tokio::spawn(actor.run());
         (shared, cancel_token)
@@ -469,7 +475,7 @@ mod tests {
     #[test]
     fn loop_schedule_instruction_holds_invariants() {
         let args = "every 30 minutes do x";
-        let instr = loop_schedule_instruction(args);
+        let instr = loop_schedule_instruction(args, LoopFireMode::Detached);
         assert!(
             !instr.contains("10m"),
             "instruction must not default: {instr}"

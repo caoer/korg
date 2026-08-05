@@ -133,8 +133,17 @@ fn enqueue_permission(
     let subagent_label = resolve_subagent_label(agent, &perm.request.session_id);
 
     // 3. Build title and description from the tool call.
-    let (title, description, bash_command_raw) =
-        build_permission_display(&perm.request, bash_highlights.as_ref());
+    let (title, description, bash_command_raw) = build_permission_display(
+        &perm.request,
+        bash_highlights.as_ref(),
+        #[cfg(feature = "local-workspace")]
+        matches!(
+            agent.workspace_mode,
+            crate::views::welcome::WelcomeWorkspaceMode::LocalWorkspace
+        ),
+        #[cfg(not(feature = "local-workspace"))]
+        false,
+    );
 
     // 4. Assign a monotonic ID.
     let perm_id = agent.next_perm_req_id;
@@ -147,6 +156,15 @@ fn enqueue_permission(
     if agent.permission_queue.is_empty() && agent.permission_stashed_prompt.is_none() {
         agent.permission_stashed_prompt = Some(agent.prompt.stash());
         agent.prompt.set_text("");
+    }
+
+    // Permissions bypass the interceptor in Scrollback, so focus Prompt for the first queued request.
+    if agent.permission_queue.is_empty()
+        && agent.active_pane == AgentPane::Scrollback
+        && agent.permission_stashed_pane.is_none()
+    {
+        agent.permission_stashed_pane = Some(AgentPane::Scrollback);
+        agent.set_active_pane(AgentPane::Prompt, true);
     }
 
     // 6. Clone options before moving perm into the struct.
@@ -227,6 +245,7 @@ fn resolve_subagent_label(agent: &AgentView, session_id: &acp::SessionId) -> Opt
 fn build_permission_display(
     req: &acp::RequestPermissionRequest,
     bash_highlights: Option<&BashCommandHighlights>,
+    session_local_workspace: bool,
 ) -> (String, Vec<String>, Option<String>) {
     let is_bash = bash_highlights.is_some();
 
@@ -294,9 +313,46 @@ fn build_permission_display(
         }
     };
 
-    let description = mcp_args_lines(req);
+    let title = qualify_permission_title_for_local_workspace(title, session_local_workspace);
+    let description = permission_description_lines(req);
     let bash_cmd = if is_execute { raw_command } else { None };
     (title, description, bash_cmd)
+}
+
+/// Per-session HITL copy — not process-global CLI stamp.
+fn qualify_permission_title_for_local_workspace(
+    title: String,
+    session_local_workspace: bool,
+) -> String {
+    if !session_local_workspace {
+        return title;
+    }
+    if title.contains("on your machine") {
+        return title;
+    }
+    if let Some(stripped) = title.strip_suffix('?') {
+        return format!("{stripped} (on your machine)?");
+    }
+    format!("{title} (on your machine)")
+}
+
+/// Lines shown under the permission title: protected-edit note (if any), then
+/// MCP planned-argument lines (empty for bash/edit).
+fn permission_description_lines(req: &acp::RequestPermissionRequest) -> Vec<String> {
+    let mut lines = mcp_args_lines(req);
+    if is_edit_permission(req)
+        && let Some(desc) = protected_edit_description(req)
+    {
+        lines.insert(0, desc);
+    }
+    lines
+}
+
+fn protected_edit_description(req: &acp::RequestPermissionRequest) -> Option<String> {
+    let meta = req.meta.as_ref()?;
+    let protected: xai_grok_workspace::permission::ProtectedEditPermission =
+        serde_json::from_value(serde_json::Value::Object(meta.clone())).ok()?;
+    protected.description.filter(|s| !s.is_empty())
 }
 
 /// Maximum stored lines for the MCP planned-arguments display. The overlay
@@ -380,6 +436,37 @@ pub(super) fn should_drop_late_auto_recap(auto: bool, is_replay: bool, agent_idl
     auto && !is_replay && !agent_idle
 }
 
+/// Live auto recap when scrollback already has a recap after the last user
+/// prompt. Replay still rebuilds history as stored.
+pub(super) fn should_drop_duplicate_auto_recap(
+    auto: bool,
+    is_replay: bool,
+    scrollback: &crate::scrollback::state::ScrollbackState,
+) -> bool {
+    auto && !is_replay && scrollback_has_recap_since_last_user(scrollback)
+}
+
+fn scrollback_has_recap_since_last_user(
+    scrollback: &crate::scrollback::state::ScrollbackState,
+) -> bool {
+    use crate::scrollback::block::RenderBlock;
+    use crate::scrollback::blocks::SessionEvent;
+
+    let mut recap_since_user = false;
+    for (_, entry) in scrollback.iter_entries() {
+        if entry.block.is_user_prompt() {
+            recap_since_user = false;
+            continue;
+        }
+        if let RenderBlock::SessionEvent(b) = &entry.block
+            && matches!(b.event, SessionEvent::Recap { .. })
+        {
+            recap_since_user = true;
+        }
+    }
+    recap_since_user
+}
+
 /// Land a `SessionRecap` block: fill a manual `/recap`'s in-flight loading
 /// spinner in place (and stop its animation) when one is showing, otherwise
 /// append a fresh block. An automatic recap never consumes the manual loading
@@ -420,5 +507,22 @@ pub(super) fn apply_recap_block(agent: &mut AgentView, auto: bool, recap_block: 
         None => {
             agent.scrollback.push_block(recap_block);
         }
+    }
+}
+
+#[cfg(all(test, feature = "local-workspace"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_title_qualifies_for_local_workspace() {
+        assert_eq!(
+            qualify_permission_title_for_local_workspace("Allow Edit?".into(), false),
+            "Allow Edit?"
+        );
+        assert_eq!(
+            qualify_permission_title_for_local_workspace("Allow Edit?".into(), true),
+            "Allow Edit (on your machine)?"
+        );
     }
 }

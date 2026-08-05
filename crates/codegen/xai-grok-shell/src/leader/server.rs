@@ -15,8 +15,8 @@ const LEADER_VERSION: &str = match option_env!("VERSION_WITH_COMMIT") {
 };
 use super::protocol::{
     ClientCapabilities, ClientId, ClientMessage, ClientMode, ControlCommand, ControlPayload,
-    LEADER_PROTOCOL_VERSION, LeaderCapabilities, ProtocolError, ServerMessage, read_message,
-    write_message,
+    InternalMethod, LEADER_PROTOCOL_VERSION, LeaderCapabilities, ProtocolError, ServerMessage,
+    internal_notification, read_message, write_message,
 };
 use super::transport::{LeaderListener, LeaderStream};
 use crate::agent::activity::AgentActivity;
@@ -145,7 +145,7 @@ impl LeaderServerControlState {
             workspace: Arc::new(WorkspaceControl::new(None)),
         }
     }
-    pub fn with_default_hub_url(mut self, default_hub_url: Option<String>) -> Self {
+    pub(crate) fn with_default_hub_url(mut self, default_hub_url: Option<String>) -> Self {
         self.workspace = Arc::new(WorkspaceControl::new(default_hub_url));
         self
     }
@@ -184,9 +184,11 @@ impl WorkspaceControl {
     }
     /// Wire the hub credential to the leader's shared `AuthManager` (sole
     /// owner of refresh + persistence).
-    pub fn set_auth_manager(&self, auth_manager: Arc<AuthManager>) {
-        self.auth
-            .send_replace(Some(Arc::new(LeaderAuthProvider { auth_manager })));
+    pub(crate) fn set_auth_manager(&self, auth_manager: Arc<AuthManager>) {
+        self.auth.send_replace(Some(Arc::new(LeaderAuthProvider {
+            auth_manager,
+            refresh_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })));
     }
 }
 impl std::fmt::Debug for WorkspaceControl {
@@ -200,6 +202,11 @@ impl std::fmt::Debug for WorkspaceControl {
 /// current token at each connect/reconnect; never writes auth.json.
 struct LeaderAuthProvider {
     auth_manager: Arc<AuthManager>,
+    /// One background refresh at a time. `current()` is called by a reconnect
+    /// loop that can spin fast while offline; `refresh_lock` would serialize
+    /// those tasks but not collapse them, so each queued one would still issue
+    /// its own IdP call once the previous released.
+    refresh_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 impl std::fmt::Debug for LeaderAuthProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -208,9 +215,34 @@ impl std::fmt::Debug for LeaderAuthProvider {
 }
 impl AuthProvider for LeaderAuthProvider {
     fn current(&self) -> AuthCredential {
-        let token = self
-            .auth_manager
-            .current_or_expired()
+        use std::sync::atomic::Ordering;
+        let cached = self.auth_manager.current();
+        if cached.is_none()
+            && self.auth_manager.is_expired()
+            && self
+                .refresh_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            struct ClaimGuard(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for ClaimGuard {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let guard = ClaimGuard(Arc::clone(&self.refresh_in_flight));
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let am = Arc::clone(&self.auth_manager);
+                handle.spawn(async move {
+                    let _guard = guard;
+                    if let Err(e) = am.auth().await {
+                        tracing::debug!(error = %e, "leader hub auth: background refresh failed");
+                    }
+                });
+            }
+        }
+        let token = cached
+            .or_else(|| self.auth_manager.current_or_expired())
             .map(|a| a.key)
             .unwrap_or_default();
         AuthCredential::bearer(token)
@@ -306,14 +338,13 @@ fn extract_session_id(json: &serde_json::Value) -> Option<String> {
                 .map(|s| s.to_string())
         })
 }
-/// Whether a payload is a `session/load` request. Used to start buffering live
-/// broadcasts to the loading client until its replay completes (the
-/// live-before-replay race, see `load_live_buffer`). Only `session/load`
-/// triggers this — `session/new` creators receive everything live correctly.
-fn is_session_load_request(json: &serde_json::Value) -> bool {
+/// Whether a payload attaches an existing session (`session/load` or
+/// `session/resume`): both need live-broadcast buffering until the response
+/// (see `load_live_buffer`) and the pending-modal replay keyed on it.
+fn is_session_attach_request(json: &serde_json::Value) -> bool {
     json.get("method")
         .and_then(|m| m.as_str())
-        .is_some_and(|m| m == "session/load")
+        .is_some_and(|m| m == "session/load" || m == "session/resume")
 }
 /// Extract the leader unicast target `ClientId` from a notification's
 /// `params._meta["x.ai/leaderClientId"]`.
@@ -625,9 +656,11 @@ fn backfill_child_routes(
         }
     }
 }
-/// Inject client capabilities into a session/new request, **in place**.
+/// Inject the requesting client's context into a `session/new`, `session/load`,
+/// or `session/resume` request, **in place**. The agent's own state names
+/// whichever client initialized last, which in leader mode is the wrong client.
 ///
-/// If the payload is a session/new request:
+/// For a session/new request:
 /// - If the client has yolo_mode enabled, injects `yoloMode: true` into the request's `_meta` object.
 /// - If the client has default_model set and the request doesn't already have a modelId,
 ///   injects `modelId` into the request's `_meta` object.
@@ -635,7 +668,7 @@ fn backfill_child_routes(
 ///   (used for scoping `yolo_mode_changed` broadcasts in leader mode).
 ///
 /// Returns `true` when `json` was mutated.
-fn inject_capabilities_into_session_new(
+fn inject_session_request_context(
     json: &mut serde_json::Value,
     capabilities: &ClientCapabilities,
     client_type: &str,
@@ -656,7 +689,8 @@ fn inject_capabilities_into_session_new(
     let method = json.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let is_session_new = method == AGENT_METHOD_NAMES.session_new;
     let is_session_load = method == AGENT_METHOD_NAMES.session_load;
-    if !is_session_new && !is_session_load {
+    let is_session_resume = method == AGENT_METHOD_NAMES.session_resume;
+    if !is_session_new && !is_session_load && !is_session_resume {
         return false;
     }
     let mut mutated = false;
@@ -843,11 +877,15 @@ fn inject_client_identity_into_yolo_notification(
 /// Returns `None` for notifications (no `id`) — those are silently dropped.
 fn make_leader_starting_error(json: &serde_json::Value) -> Option<String> {
     let id = json.get("id").filter(|v| !v.is_null()).cloned()?;
-    let response = serde_json::json!(
-        { "jsonrpc" : "2.0", "id" : id, "error" : { "code" : - 32002, "message" :
-        "leader_starting", "data" :
-        "Leader is still initializing (auth/prefetch in progress). Retry shortly." } }
-    );
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32002,
+            "message": "leader_starting",
+            "data": "Leader is still initializing (auth in progress). Retry shortly."
+        }
+    });
     Some(response.to_string())
 }
 /// Choose the bytes forwarded to the agent: the re-serialized `json` when an
@@ -884,7 +922,7 @@ fn patch_initialize_response_model(
     if needs_patch {
         json["result"]["meta"]["modelState"]["currentModelId"] =
             serde_json::Value::String(model.clone());
-        debug!(patched_model = % model, "Patched initialize response currentModelId");
+        debug!(patched_model = %model, "Patched initialize response currentModelId");
         return true;
     }
     false
@@ -959,7 +997,7 @@ fn leader_info_payload(control_state: &LeaderServerControlState) -> ControlPaylo
         profile_formats: manager.profile_formats().to_vec(),
     }
 }
-const PROD_COMPUTER_HUB_URL: &str = "wss://computer-hub.grok.com/v1/tools";
+use crate::env::PROD_COMPUTER_HUB_WS_URL as PROD_COMPUTER_HUB_URL;
 const WORKSPACE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 fn workspace_err(message: impl Into<String>) -> ControlError {
     ControlError {
@@ -977,9 +1015,11 @@ async fn wait_for_leader_auth(
 ) -> Result<Arc<dyn AuthProvider>, ControlError> {
     let mut rx = ws.auth.subscribe();
     let result = tokio::select! {
-        result = rx.wait_for(| v | v.is_some()) => result, _ = cancel.cancelled() => {
-        return
-        Err(workspace_err("leader is shutting down; cannot expose workspace to the hub",));
+        result = rx.wait_for(|v| v.is_some()) => result,
+        _ = cancel.cancelled() => {
+            return Err(workspace_err(
+                "leader is shutting down; cannot expose workspace to the hub",
+            ));
         }
     };
     match result {
@@ -1090,10 +1130,11 @@ async fn handle_workspace_start(
     let alpha_test_key = None;
     let auth = wait_for_leader_auth(ws, &cancel).await?;
     let server_id = workspace_server_id();
-    let metadata = serde_json::json!(
-        { "source" : "grok-workspace", "hostname" : gethostname::gethostname()
-        .to_string_lossy(), "cwd" : cwd_path.display().to_string(), }
-    );
+    let metadata = serde_json::json!({
+        "source": "grok-workspace",
+        "hostname": gethostname::gethostname().to_string_lossy(),
+        "cwd": cwd_path.display().to_string(),
+    });
     let upload_queue_enabled =
         std::env::var("GROK_WORKSPACE_UPLOAD_QUEUE_ENABLED").as_deref() != Ok("false");
     crate::agent::folder_trust::resolve_and_record(&cwd_path, None, false);
@@ -1265,7 +1306,7 @@ async fn handle_stop_cpu_profile(
     let result = result.map_err(|join_error| ControlError {
         code: ControlErrorCode::InternalError,
         message: "CPU profile stop task failed".to_string(),
-        details: Some(serde_json::json!({ "error" : join_error.to_string() })),
+        details: Some(serde_json::json!({ "error": join_error.to_string() })),
     })??;
     Ok(ControlPayload::CpuProfileStopped {
         pid,
@@ -1282,10 +1323,7 @@ async fn finalize_cpu_profile_on_shutdown(control_state: LeaderServerControlStat
         let stop_handle = match manager.take_shutdown_stop_handle() {
             Ok(stop_handle) => stop_handle,
             Err(error) => {
-                warn!(
-                    error = % error,
-                    "Failed to prepare active CPU profile for leader shutdown"
-                );
+                warn!(error = %error, "Failed to prepare active CPU profile for leader shutdown");
                 return;
             }
         };
@@ -1315,19 +1353,20 @@ async fn finalize_cpu_profile_on_shutdown(control_state: LeaderServerControlStat
     match result {
         Ok(Ok(result)) => {
             info!(
-                path = % result.svg_path.display(), started_at = % result.started_at,
-                stopped_at = % result.stopped_at,
+                path = %result.svg_path.display(),
+                started_at = %result.started_at,
+                stopped_at = %result.stopped_at,
                 "Finalized active CPU profile during leader shutdown"
             );
         }
         Ok(Err(error)) => {
-            warn!(
-                error = % error,
-                "Failed to finalize active CPU profile during leader shutdown"
-            );
+            warn!(error = %error, "Failed to finalize active CPU profile during leader shutdown");
         }
         Err(join_error) => {
-            warn!(error = % join_error, "CPU profile shutdown finalization task failed");
+            warn!(
+                error = %join_error,
+                "CPU profile shutdown finalization task failed"
+            );
         }
     }
 }
@@ -1360,7 +1399,8 @@ fn decide_relaunch_for_update(
     let leader_version = control_state.metadata.leader_binary_version.clone();
     if !super::leader_is_older_than(&leader_version, &to_version) {
         debug!(
-            from_version = % leader_version, to_version = % to_version,
+            from_version = %leader_version,
+            to_version = %to_version,
             "RelaunchForUpdate declined: target is not strictly newer (or unparseable)"
         );
         return Ok(ControlPayload::RelaunchDeclined {
@@ -1373,8 +1413,9 @@ fn decide_relaunch_for_update(
         });
     }
     info!(
-        from_version = % leader_version, to_version = % to_version, grace_ms =
-        RELAUNCH_TOTAL_GRACE.as_millis() as u64,
+        from_version = %leader_version,
+        to_version = %to_version,
+        grace_ms = RELAUNCH_TOTAL_GRACE.as_millis() as u64,
         "RelaunchForUpdate accepted; draining before relaunch onto new binary"
     );
     Ok(ControlPayload::Relaunching {
@@ -1406,8 +1447,9 @@ fn spawn_relaunch_drain(
                 break;
             }
             tokio::select! {
-                _ = cancel.cancelled() => return, _ =
-                tokio::time::sleep(RELAUNCH_GRACE_POLL) => {}
+                // Another path already triggered shutdown — let it own the exit.
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(RELAUNCH_GRACE_POLL) => {}
             }
         }
         agent_activity
@@ -1437,14 +1479,18 @@ fn make_version_mismatch_notification(
         return None;
     }
     Some(
-        serde_json::json!(
-            { "jsonrpc" : "2.0", "method" : "x.ai/leader/version_mismatch", "params" : {
-            "clientVersion" : client_version, "leaderVersion" : leader_version, "message"
-            :
-            format!("Client version {client_version} differs from leader version \
-                     {leader_version}. Restart the grok binary to use the same version.")
-            } }
-        )
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "x.ai/leader/version_mismatch",
+            "params": {
+                "clientVersion": client_version,
+                "leaderVersion": leader_version,
+                "message": format!(
+                    "Client version {client_version} differs from leader version \
+                     {leader_version}. Restart the grok binary to use the same version."
+                )
+            }
+        })
         .to_string(),
     )
 }
@@ -1468,7 +1514,8 @@ fn make_version_mismatch_notification(
 ///   JSON-RPC error so the client can retry rather than hang.
 /// - ACP notifications (no `id`) are dropped with a trace log.
 ///
-/// Once `ready_rx` is signaled `true` (auth + prefetch complete), all subsequent
+/// Once `ready_rx` is signaled `true` (socket bound + bounded auth complete; the
+/// model catalog and remote settings stream in afterward), all subsequent
 /// ACP traffic is forwarded to the agent as normal.
 ///
 /// # Arguments
@@ -1538,11 +1585,13 @@ pub async fn run_leader_server(
     let relaunching = Arc::new(AtomicBool::new(false));
     loop {
         let poll = tokio::select! {
-            biased; _ = cancel.cancelled() => LeaderServerPoll::Cancelled, accept_result
-            = listener.accept() => { LeaderServerPoll::Accept(accept_result.map(|
-            (stream, _) | stream)) } Ok(event) = event_rx.recv() =>
-            LeaderServerPoll::Event(event), Some(payload) = response_rx.recv() =>
-            LeaderServerPoll::Response(payload),
+            biased;
+            _ = cancel.cancelled() => LeaderServerPoll::Cancelled,
+            accept_result = listener.accept() => {
+                LeaderServerPoll::Accept(accept_result.map(|(stream, _)| stream))
+            }
+            Ok(event) = event_rx.recv() => LeaderServerPoll::Event(event),
+            Some(payload) = response_rx.recv() => LeaderServerPoll::Response(payload),
         };
         match poll {
             LeaderServerPoll::Cancelled => {
@@ -1582,7 +1631,7 @@ pub async fn run_leader_server(
                         control_state.clone(),
                     );
                 }
-                Err(e) => error!(error = % e, "Accept failed"),
+                Err(e) => error!(error = %e, "Accept failed"),
             },
             LeaderServerPoll::Event(event) => match event {
                 ServerEvent::Registered(id, mode, capabilities, client_type) => {
@@ -1592,17 +1641,14 @@ pub async fn run_leader_server(
                         client.client_type = client_type;
                         client.registered = true;
                         client_count.fetch_add(1, Ordering::Relaxed);
-                        debug!(
-                            client_id = id.0, ? mode, yolo_mode = client.capabilities
-                            .yolo_mode, client_type = % client.client_type,
-                            "Client registered"
-                        );
+                        debug!(client_id = id.0, ?mode, yolo_mode = client.capabilities.yolo_mode, client_type = %client.client_type, "Client registered");
                         xai_grok_telemetry::unified_log::info(
                             "leader.client.registered",
                             None,
-                            Some(serde_json::json!(
-                                { "client_id" : id.0, "client_type" : client.client_type, }
-                            )),
+                            Some(serde_json::json!({
+                                "client_id": id.0,
+                                "client_type": client.client_type,
+                            })),
                         );
                         if mode == ClientMode::Headless {
                             let newly_demanded = relay_demand_tx.send_if_modified(|demanded| {
@@ -1643,7 +1689,7 @@ pub async fn run_leader_server(
                         xai_grok_telemetry::unified_log::info(
                             "leader.client.disconnected",
                             None,
-                            Some(serde_json::json!({ "client_id" : id.0 })),
+                            Some(serde_json::json!({ "client_id": id.0 })),
                         );
                     }
                     pending_load_by_req.retain(|_, (c, _)| *c != id);
@@ -1672,7 +1718,9 @@ pub async fn run_leader_server(
                             {
                                 session_driver.insert(sid.clone(), next);
                                 debug!(
-                                    session_id = % sid, old_driver = id.0, new_driver = next.0,
+                                    session_id = %sid,
+                                    old_driver = id.0,
+                                    new_driver = next.0,
                                     "Transferred session driver after disconnect"
                                 );
                             } else {
@@ -1684,12 +1732,10 @@ pub async fn run_leader_server(
                         last_active_client = None;
                     }
                     if !detached_sessions.is_empty() {
-                        let evict_notification = serde_json::json!(
-                            { "jsonrpc" : "2.0", "method" :
-                            "x.ai/internal/evict_sessions", "params" : { "sessionIds" :
-                            detached_sessions } }
-                        );
-                        let _ = acp_tx.send(evict_notification.to_string());
+                        let _ = acp_tx.send(internal_notification(
+                            InternalMethod::EvictSessions,
+                            serde_json::json!({ "sessionIds": detached_sessions }),
+                        ));
                         info!(
                             client_id = id.0,
                             session_count = detached_sessions.len(),
@@ -1758,10 +1804,7 @@ pub async fn run_leader_server(
                                 .send(ServerMessage::ControlResult { request_id, result }.into())
                                 .await
                             {
-                                warn!(
-                                    client_id = id.0, error = % e,
-                                    "Failed to send control response to client"
-                                );
+                                warn!(client_id = id.0, error = %e, "Failed to send control response to client");
                             }
                             if arm_relaunch {
                                 spawn_relaunch_drain(
@@ -1833,10 +1876,7 @@ pub async fn run_leader_server(
                             );
                         }
                         if let Some(new_model) = extract_model_id_from_set_model(json) {
-                            debug!(
-                                client_id = id.0, model = % new_model,
-                                "Updated client default_model from session/setModel"
-                            );
+                            debug!(client_id = id.0, model = %new_model, "Updated client default_model from session/setModel");
                             client.capabilities.default_model = Some(new_model);
                         }
                     }
@@ -1857,7 +1897,7 @@ pub async fn run_leader_server(
                                 }
                             }
                         }
-                        payload_mutated |= inject_capabilities_into_session_new(
+                        payload_mutated |= inject_session_request_context(
                             json,
                             &client.capabilities,
                             &client.client_type,
@@ -1871,7 +1911,7 @@ pub async fn run_leader_server(
                     let rewritten = json.as_mut().and_then(|j| rewrite_request_id(j, id));
                     payload_mutated |= rewritten.is_some();
                     if let Some(json) = json.as_ref()
-                        && is_session_load_request(json)
+                        && is_session_attach_request(json)
                         && let Some(load_sid) = extract_session_id(json)
                         && let Some((ns_id, _)) = rewritten.as_ref()
                     {
@@ -1905,10 +1945,10 @@ pub async fn run_leader_server(
                     xai_grok_telemetry::unified_log::warn(
                         "leader.response.orphaned",
                         None,
-                        Some(serde_json::json!(
-                            { "client_id" : orphan_client.0, "request_id" :
-                            orphan_req_id, }
-                        )),
+                        Some(serde_json::json!({
+                            "client_id": orphan_client.0,
+                            "request_id": orphan_req_id,
+                        })),
                     );
                 }
                 if let Some((client_id, ref raw_response_id)) = parsed_response
@@ -1952,22 +1992,21 @@ pub async fn run_leader_server(
                             xai_grok_telemetry::unified_log::warn(
                                 "leader.response.send_failed",
                                 None,
-                                Some(serde_json::json!(
-                                    { "client_id" : client_id.0, "reason" : "channel_full", }
-                                )),
+                                Some(serde_json::json!({
+                                    "client_id": client_id.0,
+                                    "reason": "channel_full",
+                                })),
                             );
                         }
                         Err(e) => {
-                            warn!(
-                                client_id = client_id.0, error = % e,
-                                "Failed to send response to client (channel closed)"
-                            );
+                            warn!(client_id = client_id.0, error = %e, "Failed to send response to client (channel closed)");
                             xai_grok_telemetry::unified_log::warn(
                                 "leader.response.send_failed",
                                 None,
-                                Some(serde_json::json!(
-                                    { "client_id" : client_id.0, "reason" : "channel_closed", }
-                                )),
+                                Some(serde_json::json!({
+                                    "client_id": client_id.0,
+                                    "reason": "channel_closed",
+                                })),
                             );
                         }
                     }
@@ -1991,10 +2030,7 @@ pub async fn run_leader_server(
                                 if let Err(e) =
                                     target.tx.try_send(ClientOutbound::Acp(buffered_payload))
                                 {
-                                    warn!(
-                                        client_id = buf_client.0, error = % e,
-                                        "Failed to flush buffered live notification after load (channel closed)"
-                                    );
+                                    warn!(client_id = buf_client.0, error = %e, "Failed to flush buffered live notification after load (channel closed)");
                                     break;
                                 }
                                 count += 1;
@@ -2015,10 +2051,7 @@ pub async fn run_leader_server(
                             for req in cached.values() {
                                 if let Err(e) = target.tx.try_send(ClientOutbound::Acp(req.clone()))
                                 {
-                                    warn!(
-                                        client_id = buf_client.0, error = % e,
-                                        "Failed to replay interaction request after load (channel closed)"
-                                    );
+                                    warn!(client_id = buf_client.0, error = %e, "Failed to replay interaction request after load (channel closed)");
                                     break;
                                 }
                             }
@@ -2056,10 +2089,7 @@ pub async fn run_leader_server(
                                         .or_default()
                                         .insert(child_sid.clone());
                                 }
-                                debug!(
-                                    client_id = target.0, child_session_id = % child_sid,
-                                    "Registered child route from replayed SubagentSpawned"
-                                );
+                                debug!(client_id = target.0, child_session_id = %child_sid, "Registered child route from replayed SubagentSpawned");
                                 session_subscribers
                                     .entry(child_sid)
                                     .or_default()
@@ -2105,10 +2135,7 @@ pub async fn run_leader_server(
                                 );
                             }
                             Err(e) => {
-                                warn!(
-                                    client_id = target.0, error = % e,
-                                    "Failed to unicast replay notification to loading client (channel closed)"
-                                );
+                                warn!(client_id = target.0, error = %e, "Failed to unicast replay notification to loading client (channel closed)");
                             }
                         }
                     } else {
@@ -2180,11 +2207,7 @@ pub async fn run_leader_server(
                                 if let Err(e) =
                                     client.tx.try_send(ClientOutbound::Acp(payload.clone()))
                                 {
-                                    warn!(
-                                        client_id = driver_id.0, session_id = sid.as_str(),
-                                        is_inject = is_inject_prompt, error = % e,
-                                        "Failed to route driver-only message (channel closed)"
-                                    );
+                                    warn!(client_id = driver_id.0, session_id = sid.as_str(), is_inject = is_inject_prompt, error = %e, "Failed to route driver-only message (channel closed)");
                                 } else {
                                     trace!(
                                         client_id = driver_id.0,
@@ -2229,10 +2252,7 @@ pub async fn run_leader_server(
                                 if let Err(e) =
                                     client.tx.try_send(ClientOutbound::Acp(payload.clone()))
                                 {
-                                    warn!(
-                                        client_id = cid.0, session_id = sid.as_str(), error = % e,
-                                        "Failed to broadcast notification to subscriber (channel closed)"
-                                    );
+                                    warn!(client_id = cid.0, session_id = sid.as_str(), error = %e, "Failed to broadcast notification to subscriber (channel closed)");
                                 } else {
                                     trace!(
                                         client_id = cid.0,
@@ -2249,11 +2269,7 @@ pub async fn run_leader_server(
                                 .get(sid.as_str())
                                 .cloned()
                                 .unwrap_or_default();
-                            info!(
-                                child_session_id = % child_sid, subscriber_count =
-                                parent_subs.len(),
-                                "Registered child session from SubagentSpawned"
-                            );
+                            info!(child_session_id = %child_sid, subscriber_count = parent_subs.len(), "Registered child session from SubagentSpawned");
                             session_subscribers.insert(child_sid.clone(), parent_subs);
                             if let Some(&driver_id) = session_driver.get(sid.as_str()) {
                                 session_driver.insert(child_sid.clone(), driver_id);
@@ -2264,10 +2280,7 @@ pub async fn run_leader_server(
                                 .insert(child_sid);
                         }
                         Some(ChildSessionEvent::Finished(child_sid)) => {
-                            debug!(
-                                child_session_id = % child_sid,
-                                "Deregistered child session from SubagentFinished"
-                            );
+                            debug!(child_session_id = %child_sid, "Deregistered child session from SubagentFinished");
                             prune_child_route(
                                 &child_sid,
                                 &mut session_subscribers,
@@ -2311,10 +2324,7 @@ pub async fn run_leader_server(
                         "Using fallback routing to last active client"
                     );
                     if let Err(e) = client.tx.try_send(ClientOutbound::Acp(payload)) {
-                        warn!(
-                            client_id = client_id.0, error = % e,
-                            "Failed to send notification via fallback routing (channel closed)"
-                        );
+                        warn!(client_id = client_id.0, error = %e, "Failed to send notification via fallback routing (channel closed)");
                     }
                 } else {
                     debug!("No client available for notification routing, message dropped");
@@ -2348,7 +2358,7 @@ fn spawn_client_handler(
         )
         .await;
         if let Err(e) = &result {
-            debug!(client_id = client_id.0, error = % e, "Client session ended");
+            debug!(client_id = client_id.0, error = %e, "Client session ended");
         }
         let _ = event_tx.send(ServerEvent::Disconnected(client_id)).await;
     });
@@ -2367,7 +2377,7 @@ async fn run_client_session(
         match tokio::time::timeout(REGISTRATION_TIMEOUT, read_message(&mut reader)).await {
             Ok(Ok(msg)) => msg,
             Ok(Err(e)) => {
-                warn!(client_id = client_id.0, error = % e, "Registration failed");
+                warn!(client_id = client_id.0, error = %e, "Registration failed");
                 return Err(e);
             }
             Err(_) => {
@@ -2428,9 +2438,18 @@ async fn run_client_session(
         );
         while !*ready_rx.borrow() {
             tokio::select! {
-                biased; _ = cancel.cancelled() => { drain_client_outbound_on_cancel(&
-                server_rx, & mut writer). await; return Ok(()); } result = ready_rx
-                .changed() => { if result.is_err() { return Ok(()); } }
+                biased;
+                _ = cancel.cancelled() => {
+                    drain_client_outbound_on_cancel(&server_rx, &mut writer).await;
+                    return Ok(());
+                }
+                result = ready_rx.changed() => {
+                    if result.is_err() {
+                        // Watch sender was dropped (leader shutting down without ready).
+                        return Ok(());
+                    }
+                    // Loop re-checks *ready_rx.borrow() at top; no Ref held across await.
+                }
             }
         }
         write_message(&mut writer, &ServerMessage::LeaderReady).await?;
@@ -2447,20 +2466,35 @@ async fn run_client_session(
             client_type.clone(),
         ))
         .await;
-    info!(
-        client_id = client_id.0, client_type = % client_type, ? mode, yolo_mode =
-        capabilities.yolo_mode, client_version = ? capabilities.client_version,
-        "Client registered"
-    );
+    info!(client_id = client_id.0, client_type = %client_type, ?mode, yolo_mode = capabilities.yolo_mode, client_version = ?capabilities.client_version, "Client registered");
     loop {
         tokio::select! {
-            biased; _ = cancel.cancelled() => { drain_client_outbound_on_cancel(&
-            server_rx, & mut writer). await; break; } Ok(msg) = server_rx.recv() => { if
-            write_outbound(& mut writer, & msg). await .is_err() { break; } } msg_result
-            = read_message::< _, ClientMessage > (& mut reader) => { match
-            handle_client_inbound_message(msg_result, client_id, & event_tx, & mut
-            writer,). await ? { ClientSessionAction::Continue => {}
-            ClientSessionAction::Break => break, } }
+            biased;
+
+            _ = cancel.cancelled() => {
+                drain_client_outbound_on_cancel(&server_rx, &mut writer).await;
+                break;
+            }
+
+            Ok(msg) = server_rx.recv() => {
+                if write_outbound(&mut writer, &msg).await.is_err() {
+                    break;
+                }
+            }
+
+            msg_result = read_message::<_, ClientMessage>(&mut reader) => {
+                match handle_client_inbound_message(
+                    msg_result,
+                    client_id,
+                    &event_tx,
+                    &mut writer,
+                )
+                .await?
+                {
+                    ClientSessionAction::Continue => {}
+                    ClientSessionAction::Break => break,
+                }
+            }
         }
     }
     Ok(())
@@ -2521,7 +2555,7 @@ where
             Ok(ClientSessionAction::Continue)
         }
         Err(e) => {
-            warn!(client_id = client_id.0, error = % e, "Protocol error");
+            warn!(client_id = client_id.0, error = %e, "Protocol error");
             Ok(ClientSessionAction::Break)
         }
     }
@@ -2566,14 +2600,16 @@ pub struct ServerHandle {
     pub client_count: Arc<AtomicUsize>,
     /// Atomic flag: `true` while the agent has pending (in-flight) requests
     pub agent_busy: Arc<AtomicBool>,
-    /// Signal the IPC server that the leader is fully ready (auth + prefetch complete).
+    /// Signal the IPC server that the leader is fully ready (socket bound + bounded auth;
+    /// catalog/settings refresh runs in the background).
     ///
     /// Send `true` once the leader has finished initializing. Until then, ACP requests
     /// receive a `leader_starting` error and ACP notifications are dropped.
     ///
     /// `spawn_leader_server` sends `true` immediately so that callers that do not need
     /// staged startup (e.g. tests, in-process use) get a fully-ready server out of the box.
-    /// Production leader startup (`run_leader`) holds this back until auth + prefetch succeed.
+    /// Production leader startup (`run_leader`) holds this back until bounded auth completes
+    /// (catalog/settings are no longer prefetched; they refresh in the background).
     pub ready_tx: watch::Sender<bool>,
     /// Set the shutdown reason before cancelling so clients receive the correct `ShuttingDown`
     /// reason. The default value is [`ShutdownReason::Manual`]; send
@@ -2629,7 +2665,7 @@ pub async fn spawn_leader_server(socket_path: PathBuf) -> Result<ServerHandle, S
         )
         .await
         {
-            error!(error = % e, "Leader server error");
+            error!(error = %e, "Leader server error");
         }
     });
     Ok(ServerHandle {
@@ -2670,7 +2706,7 @@ mod tests {
         let cancel_for_actor = cancel.clone();
         let actor = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
-                if matches!(cmd, crate::session::SessionCommand::Shutdown) {
+                if matches!(cmd, crate::session::SessionCommand::Shutdown(_)) {
                     assert!(
                         !cancel_for_actor.is_cancelled(),
                         "flush must run before the leader cancels"
@@ -2920,9 +2956,11 @@ mod tests {
             let json: serde_json::Value = serde_json::from_str(&forwarded).unwrap();
             if json.get("method").and_then(|m| m.as_str()) == Some("session/load") {
                 let id = json.get("id").cloned().unwrap();
-                let response = serde_json::json!(
-                    { "jsonrpc" : "2.0", "id" : id, "result" : { "models" : [] }, }
-                );
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "models": [] },
+                });
                 response_tx.send(response.to_string()).unwrap();
                 return;
             }
@@ -3062,12 +3100,19 @@ mod tests {
         .await
         .unwrap();
         let response: ServerMessage = read_message(&mut reader).await.unwrap();
-        assert!(
-            matches!(response, ServerMessage::ControlResult { request_id, result :
-            Ok(ControlPayload::CpuProfileStatus { active : false, stopping : false,
-            started_at : None, svg_path : None, frequency_hz : None, }), } if request_id
-            == "status-1")
-        );
+        assert!(matches!(
+            response,
+            ServerMessage::ControlResult {
+                request_id,
+                result: Ok(ControlPayload::CpuProfileStatus {
+                    active: false,
+                    stopping: false,
+                    started_at: None,
+                    svg_path: None,
+                    frequency_hz: None,
+                }),
+            } if request_id == "status-1"
+        ));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), handle.acp_rx.recv())
                 .await
@@ -3324,17 +3369,20 @@ mod tests {
         assert_eq!(json["method"], "test");
     }
     #[test]
-    fn is_session_load_request_detects_only_load() {
-        assert!(is_session_load_request(&pv(
+    fn is_session_attach_request_detects_load_and_resume() {
+        assert!(is_session_attach_request(&pv(
             r#"{"jsonrpc":"2.0","id":1,"method":"session/load","params":{"sessionId":"s1","cwd":"/tmp"}}"#
         )));
-        assert!(!is_session_load_request(&pv(
+        assert!(is_session_attach_request(&pv(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/resume","params":{"sessionId":"s1","cwd":"/tmp"}}"#
+        )));
+        assert!(!is_session_attach_request(&pv(
             r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{}}"#
         )));
-        assert!(!is_session_load_request(&pv(
+        assert!(!is_session_attach_request(&pv(
             r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{"sessionId":"s1"}}"#
         )));
-        assert!(!is_session_load_request(&pv(
+        assert!(!is_session_attach_request(&pv(
             r#"{"jsonrpc":"2.0","id":1,"result":{}}"#
         )));
     }
@@ -3385,19 +3433,25 @@ mod tests {
     #[test]
     fn extract_interaction_tool_call_id_handles_direct_and_nested() {
         assert_eq!(
-            extract_interaction_tool_call_id(&
-            pv(r#"{"id":1,"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-q"}}"#))
-            .as_deref(), Some("tc-q")
+            extract_interaction_tool_call_id(&pv(
+                r#"{"id":1,"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-q"}}"#
+            ))
+            .as_deref(),
+            Some("tc-q")
         );
         assert_eq!(
-            extract_interaction_tool_call_id(&
-            pv(r#"{"id":1,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"tc-p"}}}"#))
-            .as_deref(), Some("tc-p")
+            extract_interaction_tool_call_id(&pv(
+                r#"{"id":1,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"tc-p"}}}"#
+            ))
+            .as_deref(),
+            Some("tc-p")
         );
         assert_eq!(
-            extract_interaction_tool_call_id(&
-            pv(r#"{"id":1,"method":"_x.ai/ask_user_question","params":{"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-w"}}}"#))
-            .as_deref(), Some("tc-w")
+            extract_interaction_tool_call_id(&pv(
+                r#"{"id":1,"method":"_x.ai/ask_user_question","params":{"method":"x.ai/ask_user_question","params":{"sessionId":"s","toolCallId":"tc-w"}}}"#
+            ))
+            .as_deref(),
+            Some("tc-w")
         );
         assert_eq!(
             extract_interaction_tool_call_id(&pv(r#"{"params":{}}"#)),
@@ -3407,14 +3461,18 @@ mod tests {
     #[test]
     fn extract_interaction_resolved_tool_call_id_matches_only_resolved() {
         assert_eq!(
-            extract_interaction_resolved_tool_call_id(&
-            pv(r#"{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-r"}}}"#))
-            .as_deref(), Some("tc-r")
+            extract_interaction_resolved_tool_call_id(&pv(
+                r#"{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-r"}}}"#
+            ))
+            .as_deref(),
+            Some("tc-r")
         );
         assert_eq!(
-            extract_interaction_resolved_tool_call_id(&
-            pv(r#"{"method":"_x.ai/session_notification","params":{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-rw"}}}}"#))
-            .as_deref(), Some("tc-rw")
+            extract_interaction_resolved_tool_call_id(&pv(
+                r#"{"method":"_x.ai/session_notification","params":{"method":"x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"interaction_resolved","tool_call_id":"tc-rw"}}}}"#
+            ))
+            .as_deref(),
+            Some("tc-rw")
         );
         assert_eq!(
             extract_interaction_resolved_tool_call_id(&pv(
@@ -3428,7 +3486,7 @@ mod tests {
         let mut req = pv(
             r#"{"jsonrpc":"2.0","id":7,"method":"session/load","params":{"sessionId":"sess-x","cwd":"/tmp"}}"#,
         );
-        assert!(is_session_load_request(&req));
+        assert!(is_session_attach_request(&req));
         assert_eq!(extract_session_id(&req).as_deref(), Some("sess-x"));
         let client = ClientId(3);
         let (stored_ns_id, _orig) = rewrite_request_id(&mut req, client).unwrap();
@@ -3638,7 +3696,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3661,7 +3719,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3683,7 +3741,27 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
+            &mut json,
+            &caps,
+            "grok-tui",
+            ClientId(1)
+        ));
+        assert_eq!(json["params"]["_meta"]["autoMode"], true);
+    }
+    #[test]
+    fn inject_capabilities_adds_auto_mode_to_session_resume() {
+        let payload = format!(
+            r#"{{"jsonrpc":"2.0","method":"{}","id":1,"params":{{"sessionId":"sess-1"}}}}"#,
+            AGENT_METHOD_NAMES.session_resume
+        );
+        let caps = ClientCapabilities {
+            auto_mode: true,
+            yolo_mode: false,
+            ..Default::default()
+        };
+        let mut json = pv(&payload);
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "grok-tui",
@@ -3704,7 +3782,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3724,7 +3802,7 @@ mod tests {
             default_model: None,
             ..Default::default()
         };
-        assert!(!inject_capabilities_into_session_new(
+        assert!(!inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3745,7 +3823,7 @@ mod tests {
         };
         let mut json = pv(&payload);
         let before = json.clone();
-        assert!(!inject_capabilities_into_session_new(
+        assert!(!inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3765,7 +3843,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3786,7 +3864,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3807,7 +3885,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -3828,7 +3906,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        inject_capabilities_into_session_new(&mut json, &caps, "", ClientId(1));
+        inject_session_request_context(&mut json, &caps, "", ClientId(1));
         assert_eq!(json["params"]["_meta"]["modelId"], "custom-model");
     }
     #[test]
@@ -4125,7 +4203,7 @@ mod tests {
         };
         let mut json = pv(&payload);
         let before = json.clone();
-        assert!(!inject_capabilities_into_session_new(
+        assert!(!inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -4145,7 +4223,7 @@ mod tests {
             ..Default::default()
         };
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -4167,7 +4245,7 @@ mod tests {
         };
         let mut json = pv(&payload);
         let before = json.clone();
-        assert!(!inject_capabilities_into_session_new(
+        assert!(!inject_session_request_context(
             &mut json,
             &caps,
             "",
@@ -4183,7 +4261,7 @@ mod tests {
         );
         let caps = ClientCapabilities::default();
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "grok-code-extension",
@@ -4202,7 +4280,7 @@ mod tests {
         );
         let caps = ClientCapabilities::default();
         let mut json = pv(&payload);
-        inject_capabilities_into_session_new(&mut json, &caps, "grok-tui", ClientId(1));
+        inject_session_request_context(&mut json, &caps, "grok-tui", ClientId(1));
         assert_eq!(json["params"]["_meta"]["clientIdentifier"], "custom-client");
     }
     #[test]
@@ -4213,7 +4291,7 @@ mod tests {
         );
         let caps = ClientCapabilities::default();
         let mut json = pv(&payload);
-        assert!(inject_capabilities_into_session_new(
+        assert!(inject_session_request_context(
             &mut json,
             &caps,
             "grok-code-extension",
@@ -4234,7 +4312,7 @@ mod tests {
         );
         let caps = ClientCapabilities::default();
         let mut json = pv(&payload);
-        inject_capabilities_into_session_new(&mut json, &caps, "grok-tui", ClientId(42));
+        inject_session_request_context(&mut json, &caps, "grok-tui", ClientId(42));
         assert_eq!(
             json["params"]["_meta"]["x.ai/leaderClientId"].as_u64(),
             Some(42)
@@ -4248,7 +4326,7 @@ mod tests {
         );
         let caps = ClientCapabilities::default();
         let mut json = pv(&payload);
-        inject_capabilities_into_session_new(&mut json, &caps, "grok-tui", ClientId(42));
+        inject_session_request_context(&mut json, &caps, "grok-tui", ClientId(42));
         assert_eq!(
             json["params"]["_meta"]["x.ai/leaderClientId"].as_u64(),
             Some(7)
@@ -5205,7 +5283,10 @@ mod tests {
             .expect("channel should not be closed");
         let json: serde_json::Value =
             serde_json::from_str(&eviction_msg).expect("should be valid JSON");
-        assert_eq!(json["method"], "x.ai/internal/evict_sessions");
+        assert_eq!(
+            json["method"].as_str().and_then(|m| m.strip_prefix('_')),
+            Some(InternalMethod::EvictSessions.name()),
+        );
         let session_ids = json["params"]["sessionIds"]
             .as_array()
             .expect("sessionIds should be an array");
@@ -5333,9 +5414,11 @@ mod tests {
             early.is_err(),
             "live broadcast must be buffered until the load response, got {early:?}"
         );
-        let response = serde_json::json!(
-            { "jsonrpc" : "2.0", "id" : load_id, "result" : { "models" : [] }, }
-        );
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": load_id,
+            "result": { "models": [] },
+        });
         response_tx.send(response.to_string()).unwrap();
         let first = next_acp_payload(&mut reader).await;
         assert!(
@@ -6339,7 +6422,7 @@ mod tests {
         };
         let payload = r#"{"jsonrpc":"2.0","method":"session/new","id":1,"params":{"cwd":"/repo","_meta":{}}}"#;
         let mut json = pv(payload);
-        inject_capabilities_into_session_new(&mut json, &caps, "grok-web", ClientId(1));
+        inject_session_request_context(&mut json, &caps, "grok-web", ClientId(1));
         assert_eq!(
             json["params"]["_meta"]["codeNavEnabled"],
             serde_json::json!(true),
@@ -6360,7 +6443,7 @@ mod tests {
         };
         let payload = r#"{"jsonrpc":"2.0","method":"session/new","id":1,"params":{"cwd":"/repo","_meta":{"clientIdentifier":"grok-tui"}}}"#;
         let mut json = pv(payload);
-        inject_capabilities_into_session_new(&mut json, &caps, "grok-tui", ClientId(1));
+        inject_session_request_context(&mut json, &caps, "grok-tui", ClientId(1));
         assert_eq!(
             json["params"]["_meta"]["codeNavEnabled"],
             serde_json::json!(false),
@@ -6380,7 +6463,7 @@ mod tests {
         };
         let payload = r#"{"jsonrpc":"2.0","method":"session/load","id":2,"params":{"sessionId":"abc","cwd":"/repo","_meta":{}}}"#;
         let mut json = pv(payload);
-        inject_capabilities_into_session_new(&mut json, &caps, "grok-web", ClientId(1));
+        inject_session_request_context(&mut json, &caps, "grok-web", ClientId(1));
         assert_eq!(
             json["params"]["_meta"]["codeNavEnabled"],
             serde_json::json!(true),
@@ -6402,9 +6485,9 @@ mod tests {
         };
         let session_new = r#"{"jsonrpc":"2.0","method":"session/new","id":1,"params":{"cwd":"/repo","_meta":{}}}"#;
         let mut web_json = pv(session_new);
-        inject_capabilities_into_session_new(&mut web_json, &web_caps, "grok-web", ClientId(1));
+        inject_session_request_context(&mut web_json, &web_caps, "grok-web", ClientId(1));
         let mut tui_json = pv(session_new);
-        inject_capabilities_into_session_new(&mut tui_json, &tui_caps, "grok-tui", ClientId(2));
+        inject_session_request_context(&mut tui_json, &tui_caps, "grok-tui", ClientId(2));
         assert_eq!(
             web_json["params"]["_meta"]["codeNavEnabled"],
             serde_json::json!(true)
@@ -6430,9 +6513,9 @@ mod tests {
         };
         let session_new = r#"{"jsonrpc":"2.0","method":"session/new","id":1,"params":{"cwd":"/repo","_meta":{}}}"#;
         let mut web_json = pv(session_new);
-        inject_capabilities_into_session_new(&mut web_json, &web_caps, "grok-web", ClientId(1));
+        inject_session_request_context(&mut web_json, &web_caps, "grok-web", ClientId(1));
         let mut tui_json = pv(session_new);
-        inject_capabilities_into_session_new(&mut tui_json, &tui_caps, "grok-tui", ClientId(2));
+        inject_session_request_context(&mut tui_json, &tui_caps, "grok-tui", ClientId(2));
         assert_eq!(
             web_json["params"]["_meta"]["clientTerminal"],
             serde_json::json!(true)
@@ -6468,7 +6551,7 @@ mod tests {
         };
         let session_load = r#"{"jsonrpc":"2.0","method":"session/load","id":2,"params":{"sessionId":"sess-1","_meta":{}}}"#;
         let mut json = pv(session_load);
-        inject_capabilities_into_session_new(&mut json, &caps, "grok-web", ClientId(1));
+        inject_session_request_context(&mut json, &caps, "grok-web", ClientId(1));
         assert_eq!(
             json["params"]["_meta"]["clientTerminal"],
             serde_json::json!(true)
@@ -6671,9 +6754,9 @@ mod tests {
         response_tx
             .send(
                 format!(
-                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"x.ai/leaderClientId":{}}}}}}}"#,
-                    id_a
-                ),
+                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"x.ai/leaderClientId":{}}}}}}}"#,
+                id_a
+            ),
             )
             .unwrap();
         let msg = tokio::time::timeout(Duration::from_millis(200), read_message(&mut reader_a))
@@ -6726,17 +6809,17 @@ mod tests {
         response_tx
             .send(
                 format!(
-                    r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}"#,
-                    id_a
-                ),
+                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"agent_message_chunk"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}"#,
+                id_a
+            ),
             )
             .unwrap();
         response_tx
             .send(
                 format!(
-                    r#"{{"jsonrpc":"2.0","method":"_x.ai/session/update","params":{{"params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"hook_annotation","message":"m"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}}}"#,
-                    id_a
-                ),
+                r#"{{"jsonrpc":"2.0","method":"_x.ai/session/update","params":{{"params":{{"sessionId":"sess-1","update":{{"sessionUpdate":"hook_annotation","message":"m"}},"_meta":{{"isReplay":true,"x.ai/leaderClientId":{}}}}}}}}}"#,
+                id_a
+            ),
             )
             .unwrap();
         let timeout_result: Result<Result<ServerMessage, _>, _> =

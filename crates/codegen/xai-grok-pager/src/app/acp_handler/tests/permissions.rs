@@ -186,3 +186,154 @@
         );
     }
 
+    #[test]
+    fn duplicate_live_auto_recap_dropped_after_existing_recap() {
+        let mut agent = make_agent(Some("s1"));
+        agent.scrollback.push_block(recap_block("first"));
+        assert!(should_drop_duplicate_auto_recap(
+            true,
+            false,
+            &agent.scrollback
+        ));
+        assert!(
+            !should_drop_duplicate_auto_recap(true, true, &agent.scrollback),
+            "replay must still paint stored recaps"
+        );
+        assert!(
+            !should_drop_duplicate_auto_recap(false, false, &agent.scrollback),
+            "manual /recap still allowed"
+        );
+    }
+
+    #[test]
+    fn duplicate_auto_recap_allowed_after_new_user_prompt() {
+        let mut agent = make_agent(Some("s1"));
+        agent.scrollback.push_block(recap_block("old"));
+        agent
+            .scrollback
+            .push_block(crate::scrollback::block::RenderBlock::user_prompt(
+                "next question",
+            ));
+        assert!(
+            !should_drop_duplicate_auto_recap(true, false, &agent.scrollback),
+            "new user turn re-arms auto recap"
+        );
+    }
+
+    #[test]
+    fn enqueue_while_scrollback_steals_focus_to_prompt() {
+        use crate::app::agent_view::AgentPane;
+
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .set_active_pane(AgentPane::Scrollback, true);
+
+        let (msg, _rx) = make_permission_message("sess-1");
+        handle(msg, &mut app);
+
+        let agent = &app.agents[&AgentId(0)];
+        assert_eq!(agent.permission_queue.len(), 1);
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        assert_eq!(agent.permission_stashed_pane, Some(AgentPane::Scrollback));
+    }
+
+    #[test]
+    fn enqueue_while_prompt_does_not_stash_pane() {
+        use crate::app::agent_view::AgentPane;
+
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .set_active_pane(AgentPane::Prompt, true);
+
+        let (msg, _rx) = make_permission_message("sess-1");
+        handle(msg, &mut app);
+
+        let agent = &app.agents[&AgentId(0)];
+        assert_eq!(agent.permission_queue.len(), 1);
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        assert!(agent.permission_stashed_pane.is_none());
+    }
+
+    #[test]
+    fn enqueue_while_queue_or_tasks_does_not_steal() {
+        use crate::app::agent_view::AgentPane;
+
+        for pane in [AgentPane::Queue, AgentPane::Tasks] {
+            let mut app = make_app_with_agent("sess-1");
+            app.agents
+                .get_mut(&AgentId(0))
+                .unwrap()
+                .set_active_pane(pane, true);
+
+            let (msg, _rx) = make_permission_message("sess-1");
+            handle(msg, &mut app);
+
+            let agent = &app.agents[&AgentId(0)];
+            assert_eq!(agent.permission_queue.len(), 1, "pane={pane:?}");
+            assert_eq!(agent.active_pane, pane);
+            assert!(agent.permission_stashed_pane.is_none(), "pane={pane:?}");
+        }
+    }
+
+    #[test]
+    fn second_enqueue_does_not_resteal_if_user_returned_to_scrollback() {
+        use crate::app::agent_view::AgentPane;
+
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .set_active_pane(AgentPane::Scrollback, true);
+
+        let (msg1, _rx1) = make_permission_message("sess-1");
+        handle(msg1, &mut app);
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .set_active_pane(AgentPane::Scrollback, true);
+
+        let (msg2, _rx2) = make_permission_message("sess-1");
+        handle(msg2, &mut app);
+
+        let agent = &app.agents[&AgentId(0)];
+        assert_eq!(agent.permission_queue.len(), 2);
+        assert_eq!(agent.active_pane, AgentPane::Scrollback);
+        assert_eq!(agent.permission_stashed_pane, Some(AgentPane::Scrollback));
+    }
+
+    #[test]
+    fn enqueue_while_scrollback_then_select_restores_scrollback() {
+        use crate::app::actions::Action;
+        use crate::app::agent_view::AgentPane;
+        use crate::app::dispatch::dispatch;
+        use std::sync::Arc;
+
+        let mut app = make_app_with_agent("sess-1");
+        app.agents
+            .get_mut(&AgentId(0))
+            .unwrap()
+            .set_active_pane(AgentPane::Scrollback, true);
+
+        let (msg, _rx) = make_permission_message("sess-1");
+        handle(msg, &mut app);
+        {
+            let agent = &app.agents[&AgentId(0)];
+            assert_eq!(agent.active_pane, AgentPane::Prompt);
+            assert_eq!(agent.permission_stashed_pane, Some(AgentPane::Scrollback));
+        }
+
+        let _ = dispatch(
+            Action::PermissionSelect(acp::PermissionOptionId::new(Arc::from("allow-once"))),
+            &mut app,
+        );
+
+        let agent = &app.agents[&AgentId(0)];
+        assert!(agent.permission_queue.is_empty());
+        assert_eq!(agent.active_pane, AgentPane::Scrollback);
+        assert!(agent.permission_stashed_pane.is_none());
+    }
+

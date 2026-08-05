@@ -418,9 +418,6 @@ fn last_marker_block(agent: &AgentView) -> &SessionEventBlock {
 
 #[test]
 fn real_end_marker_stays_plain_with_running_work() {
-    // Background work never rides the end marker as a "still running" suffix
-    // — the persistent "watching · …" status row carries it instead. The
-    // running command shows up in the watchers count only.
     let mut agent = running_driver("p1");
     insert_bg_task(&mut agent, "bg-1", false);
 
@@ -433,7 +430,6 @@ fn real_end_marker_stays_plain_with_running_work() {
     );
 
     let block = last_marker_block(&agent);
-    assert!(!block.parked);
     assert_eq!(block.prompt_id.as_deref(), Some("p1"));
     assert_eq!(block.event.message(), "Worked for 2.0s");
     assert_eq!(
@@ -531,4 +527,30 @@ fn driver_arm_records_cancel_trigger_for_reconcile() {
             .and_then(|p| p.cancel_trigger.as_deref()),
         Some("send_now")
     );
+}
+
+/// The turn-end marker takes no fold path — a park has no row to fold into.
+#[test]
+fn turn_end_after_park_pushes_single_marker() {
+    use crate::app::agent_view::test_fixtures::count_turn_markers;
+
+    let mut agent = running_driver("p1");
+    super::super::agent_view::test_fixtures::simulate_task_output_wait(&mut agent, "bg-1");
+    assert!(agent.renders_parked());
+    assert_eq!(count_turn_markers(&agent), 0, "the park writes no marker");
+
+    push_turn_terminal_marker(
+        &mut agent,
+        Some(SessionEvent::TurnCompleted {
+            elapsed: Some(std::time::Duration::from_secs(5)),
+        }),
+        Some("p1"),
+    );
+
+    assert_eq!(
+        count_turn_markers(&agent),
+        1,
+        "the real turn end pushes exactly one marker"
+    );
+    assert_eq!(last_marker_block(&agent).event.message(), "Worked for 5.0s");
 }

@@ -64,15 +64,16 @@ impl WebSearchClient {
             headers.insert(header_name, header_value);
         }
         let _ = alpha_test_key;
-        let http = reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .map_err(|e| {
-                xai_tool_runtime::ToolError::execution(
-                    xai_tool_protocol::ToolId::new("web_search").expect("valid"),
-                    format!("Failed to build HTTP client: {e}"),
-                )
-            })?;
+        let http = xai_grok_extra_ca::with_extra_root_certificates(
+            reqwest::Client::builder().default_headers(headers),
+        )
+        .build()
+        .map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                xai_tool_protocol::ToolId::new("web_search").expect("valid"),
+                format!("Failed to build HTTP client: {e}"),
+            )
+        })?;
         Ok(Self {
             http,
             base_url: base_url.clone(),
@@ -155,7 +156,10 @@ impl WebSearchClient {
             return Err(xai_tool_runtime::ToolError::unauthorized(format!(
                 "Responses API returned 401 Unauthorized: {body}"
             ))
-            .with_details(serde_json::json!({ "tool_id" : "web_search", "status" : 401, })));
+            .with_details(serde_json::json!({
+                "tool_id": "web_search",
+                "status": 401,
+            })));
         }
         if !status.is_success() {
             let body = response
@@ -243,7 +247,10 @@ impl WebSearchClient {
             return Err(xai_tool_runtime::ToolError::unauthorized(format!(
                 "Responses API returned 401 Unauthorized: {body}"
             ))
-            .with_details(serde_json::json!({ "tool_id" : "web_search", "status" : 401, })));
+            .with_details(serde_json::json!({
+                "tool_id": "web_search",
+                "status": 401,
+            })));
         }
         if !status.is_success() {
             let body = response
@@ -360,11 +367,11 @@ mod tests {
         invocations: std::sync::Mutex<Vec<(ToolConsumer, Option<String>)>>,
     }
     impl crate::attribution::Auth401AttributionCallback for CountingCallback {
-        fn record_401(&self, consumer: ToolConsumer, sent_bearer_prefix: Option<&str>) {
+        fn record_401(&self, consumer: ToolConsumer, sent_bearer_suffix: Option<&str>) {
             self.invocations
                 .lock()
                 .unwrap()
-                .push((consumer, sent_bearer_prefix.map(|s| s.to_string())));
+                .push((consumer, sent_bearer_suffix.map(|s| s.to_string())));
         }
     }
     /// `record_401_attribution` invokes the wired callback with
@@ -384,14 +391,14 @@ mod tests {
         let client = WebSearchClient::new(&config, None)
             .expect("client should build")
             .with_attribution_callback(Some(cb_dyn));
-        client.record_401_attribution(Some("bearer-with-long-tail-aaaaaaaaaa"));
+        client.record_401_attribution(Some("bearer-with-long-tail-aaaadistinct"));
         let calls = cb.invocations.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, ToolConsumer::WebSearch);
-        assert_eq!(calls[0].1.as_deref(), Some("bearer-with-"));
+        assert_eq!(calls[0].1.as_deref(), Some("aaaadistinct"));
         assert_eq!(
             calls[0].1.as_deref().map(str::len),
-            Some(crate::attribution::SENT_BEARER_PREFIX_LEN),
+            Some(crate::attribution::BEARER_SUFFIX_LEN),
         );
     }
     /// `record_401_attribution` is a no-op when no callback is wired
@@ -411,26 +418,56 @@ mod tests {
     }
     #[test]
     fn test_extract_citations_empty_response() {
-        let response = response_from_json(serde_json::json!(
-            { "id" : "resp_test", "object" : "response", "created_at" : 1234567890,
-            "status" : "completed", "output" : [], "model" : "test-model" }
-        ));
+        let response = response_from_json(serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "output": [],
+            "model": "test-model"
+        }));
         let citations = extract_citations(&response);
         assert!(citations.is_empty());
     }
     #[test]
     fn test_extract_citations_with_url_citations() {
-        let response = response_from_json(serde_json::json!(
-            { "id" : "resp_test", "object" : "response", "created_at" : 1234567890,
-            "status" : "completed", "model" : "test-model", "output" : [{ "type" :
-            "message", "id" : "msg_1", "status" : "completed", "role" : "assistant",
-            "content" : [{ "type" : "output_text", "text" :
-            "Here is some info about Rust.", "annotations" : [{ "type" :
-            "url_citation", "url" : "https://www.rust-lang.org/", "title" :
-            "Rust Programming Language", "start_index" : 0, "end_index" : 10 }, {
-            "type" : "url_citation", "url" : "https://docs.rs/", "title" : "Docs.rs",
-            "start_index" : 11, "end_index" : 20 }] }] }] }
-        ));
+        let response = response_from_json(serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Here is some info about Rust.",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://www.rust-lang.org/",
+                                    "title": "Rust Programming Language",
+                                    "start_index": 0,
+                                    "end_index": 10
+                                },
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://docs.rs/",
+                                    "title": "Docs.rs",
+                                    "start_index": 11,
+                                    "end_index": 20
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }));
         let citations = extract_citations(&response);
         assert_eq!(citations.len(), 2);
         assert_eq!(citations[0], "https://www.rust-lang.org/");
@@ -438,19 +475,50 @@ mod tests {
     }
     #[test]
     fn test_extract_citations_deduplicates() {
-        let response = response_from_json(serde_json::json!(
-            { "id" : "resp_test", "object" : "response", "created_at" : 1234567890,
-            "status" : "completed", "model" : "test-model", "output" : [{ "type" :
-            "message", "id" : "msg_1", "status" : "completed", "role" : "assistant",
-            "content" : [{ "type" : "output_text", "text" :
-            "Info with duplicate citations.", "annotations" : [{ "type" :
-            "url_citation", "url" : "https://example.com/page1", "title" : "Page 1",
-            "start_index" : 0, "end_index" : 5 }, { "type" : "url_citation", "url" :
-            "https://example.com/page2", "title" : "Page 2", "start_index" : 6,
-            "end_index" : 10 }, { "type" : "url_citation", "url" :
-            "https://example.com/page1", "title" : "Page 1 Again", "start_index" :
-            11, "end_index" : 15 }] }] }] }
-        ));
+        let response = response_from_json(serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Info with duplicate citations.",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://example.com/page1",
+                                    "title": "Page 1",
+                                    "start_index": 0,
+                                    "end_index": 5
+                                },
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://example.com/page2",
+                                    "title": "Page 2",
+                                    "start_index": 6,
+                                    "end_index": 10
+                                },
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://example.com/page1",
+                                    "title": "Page 1 Again",
+                                    "start_index": 11,
+                                    "end_index": 15
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }));
         let citations = extract_citations(&response);
         assert_eq!(citations.len(), 2);
         assert_eq!(citations[0], "https://example.com/page1");
@@ -458,19 +526,57 @@ mod tests {
     }
     #[test]
     fn test_extract_citations_multiple_messages() {
-        let response = response_from_json(serde_json::json!(
-            { "id" : "resp_test", "object" : "response", "created_at" : 1234567890,
-            "status" : "completed", "model" : "test-model", "output" : [{ "type" :
-            "message", "id" : "msg_1", "status" : "completed", "role" : "assistant",
-            "content" : [{ "type" : "output_text", "text" : "First message",
-            "annotations" : [{ "type" : "url_citation", "url" : "https://first.com/",
-            "title" : "First", "start_index" : 0, "end_index" : 5 }] }] }, { "type" :
-            "message", "id" : "msg_2", "status" : "completed", "role" : "assistant",
-            "content" : [{ "type" : "output_text", "text" : "Second message",
-            "annotations" : [{ "type" : "url_citation", "url" :
-            "https://second.com/", "title" : "Second", "start_index" : 0, "end_index"
-            : 6 }] }] }] }
-        ));
+        let response = response_from_json(serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "First message",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://first.com/",
+                                    "title": "First",
+                                    "start_index": 0,
+                                    "end_index": 5
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_2",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Second message",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://second.com/",
+                                    "title": "Second",
+                                    "start_index": 0,
+                                    "end_index": 6
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }));
         let citations = extract_citations(&response);
         assert_eq!(citations.len(), 2);
         assert_eq!(citations[0], "https://first.com/");
@@ -478,14 +584,36 @@ mod tests {
     }
     #[test]
     fn test_extract_citations_ignores_non_url_annotations() {
-        let response = response_from_json(serde_json::json!(
-            { "id" : "resp_test", "object" : "response", "created_at" : 1234567890,
-            "status" : "completed", "model" : "test-model", "output" : [{ "type" :
-            "message", "id" : "msg_1", "status" : "completed", "role" : "assistant",
-            "content" : [{ "type" : "output_text", "text" : "Some text",
-            "annotations" : [{ "type" : "url_citation", "url" : "https://valid.com/",
-            "title" : "Valid", "start_index" : 0, "end_index" : 4 }] }] }] }
-        ));
+        let response = response_from_json(serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Some text",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://valid.com/",
+                                    "title": "Valid",
+                                    "start_index": 0,
+                                    "end_index": 4
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }));
         let citations = extract_citations(&response);
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0], "https://valid.com/");
@@ -510,14 +638,24 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/responses"))
             .and(header("Authorization", "Bearer static-key-from-config"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
-                { "id" : "resp_test", "object" : "response", "created_at" :
-                1234567890, "status" : "completed", "model" : "test-model",
-                "output" : [{ "type" : "message", "id" : "msg_1", "status" :
-                "completed", "role" : "assistant", "content" : [{ "type" :
-                "output_text", "text" : "search result", "annotations" : []
-                }] }] }
-            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1234567890,
+                "status": "completed",
+                "model": "test-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "search result",
+                        "annotations": []
+                    }]
+                }]
+            })))
             .mount(&server)
             .await;
         let config = WebSearchConfig::Enabled {
@@ -550,14 +688,24 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/responses"))
             .and(header("Authorization", "Bearer fresh-key-from-provider"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!(
-                { "id" : "resp_test", "object" : "response", "created_at" :
-                1234567890, "status" : "completed", "model" : "test-model",
-                "output" : [{ "type" : "message", "id" : "msg_1", "status" :
-                "completed", "role" : "assistant", "content" : [{ "type" :
-                "output_text", "text" : "fresh result", "annotations" : [] }]
-                }] }
-            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "resp_test",
+                "object": "response",
+                "created_at": 1234567890,
+                "status": "completed",
+                "model": "test-model",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "fresh result",
+                        "annotations": []
+                    }]
+                }]
+            })))
             .mount(&server)
             .await;
         let config = WebSearchConfig::Enabled {
@@ -577,13 +725,28 @@ mod tests {
     }
     #[test]
     fn test_extract_citations_no_annotations() {
-        let response = response_from_json(serde_json::json!(
-            { "id" : "resp_test", "object" : "response", "created_at" : 1234567890,
-            "status" : "completed", "model" : "test-model", "output" : [{ "type" :
-            "message", "id" : "msg_1", "status" : "completed", "role" : "assistant",
-            "content" : [{ "type" : "output_text", "text" :
-            "Plain text with no annotations", "annotations" : [] }] }] }
-        ));
+        let response = response_from_json(serde_json::json!({
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "test-model",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Plain text with no annotations",
+                            "annotations": []
+                        }
+                    ]
+                }
+            ]
+        }));
         let citations = extract_citations(&response);
         assert!(citations.is_empty());
     }

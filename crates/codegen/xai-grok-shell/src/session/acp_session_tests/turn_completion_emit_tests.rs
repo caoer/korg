@@ -71,6 +71,7 @@ fn pending_input(prompt_id: &str) -> (InputItem, oneshot::Receiver<PromptTurnRes
         json_schema: None,
         origin: crate::session::PromptOrigin::User,
         task_wake_fallback: None,
+        tool_overrides_update: None,
         respond_to,
         persist_ack: None,
         parsed_prompt_tx: None,
@@ -155,6 +156,7 @@ async fn normal_completion_persists_turn_completed_after_buffered_delta_flush() 
                         completion_kind: PromptCompletionKind::Completed,
                         structured_output: None,
                         usage: None,
+                        tool_overrides: None,
                     }),
                 )
                 .await;
@@ -259,7 +261,12 @@ async fn cancellation_persists_turn_completed_cancelled() {
             }
 
             actor
-                .cancel_running_task(true, false, false, Some("ctrl_c".to_string()))
+                .cancel_running_task(crate::session::CancelOptions {
+                    cancel_subagents: true,
+                    trigger: Some(crate::session::CancelTrigger::CtrlC),
+                    user_initiated: true,
+                    ..Default::default()
+                })
                 .await;
 
             let msgs = drain_persistence(&mut persistence_rx);
@@ -454,11 +461,11 @@ async fn pristine_rewind_cancel_emits_no_turn_completed() {
                 state.pending_inputs.push_back(item);
             }
 
-            // rewind_if_pristine = true on a rewindable turn takes the rewind
+            // rewind_if_no_output = true on a rewindable turn takes the rewind
             // path: the turn is treated as UNSENT, so — in lock-step with the
             // legacy emit_turn_ended — NO durable terminal is emitted (else
             // replay would finalize a turn that was rewound, not completed).
-            actor.cancel_running_task(false, false, true, None).await;
+            actor.cancel_running_task(crate::session::CancelOptions { rewind_if_no_output: true, user_initiated: true, ..Default::default() }).await;
 
             let msgs = drain_persistence(&mut persistence_rx);
             assert!(
@@ -501,6 +508,7 @@ async fn removed_from_queue_completion_emits_no_turn_completed() {
                         completion_kind: PromptCompletionKind::RemovedFromQueue,
                         structured_output: None,
                         usage: None,
+                        tool_overrides: None,
                     }),
                 )
                 .await;
@@ -544,6 +552,7 @@ async fn unknown_prompt_completion_emits_no_turn_completed() {
                         completion_kind: PromptCompletionKind::Completed,
                         structured_output: None,
                         usage: None,
+                        tool_overrides: None,
                     }),
                 )
                 .await;

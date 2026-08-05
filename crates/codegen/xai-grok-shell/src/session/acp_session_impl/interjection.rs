@@ -74,6 +74,7 @@ impl SessionActor {
             json_schema: None,
             origin: super::super::PromptOrigin::User,
             task_wake_fallback: None,
+            tool_overrides_update: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
@@ -242,12 +243,12 @@ impl SessionActor {
         if !text.trim_start().starts_with('/') {
             return None;
         }
-        let bridge = self.agent.borrow().tool_bridge().clone();
-        let slash_skills = bridge.slash_skills().await;
+        let slash_skills = self.slash_skills_for_resolve().await;
         // Availability without `command_availability()`'s goal-reconciliation
         // side effects — this runs mid-turn inside the drain.
         let tool_names = self.registered_tool_names().await;
-        let availability = self.build_command_availability(&tool_names);
+        let has_workflow_runs = !self.workflow_tracker().await.lock().list().is_empty();
+        let availability = self.build_command_availability(&tool_names, has_workflow_runs);
         let parsed = slash_commands::parse_skill_references(text, &slash_skills, availability)?;
         // Deliberately lighter telemetry than turn start: no `skill.activated`
         // span, `PluginUsed`, or `active_skill` stamp — those attribute the
@@ -264,6 +265,7 @@ impl SessionActor {
                 xai_grok_telemetry::events::SkillDispatched {
                     skill_name: sk.name.clone(),
                     plugin_source: sk.plugin_name.clone(),
+                    trigger: xai_grok_telemetry::events::SkillTrigger::SlashCommand,
                 },
             );
         }

@@ -1,5 +1,311 @@
 # Changelog
 
+# 0.2.120 — 2026-08-03
+
+## Bug Fixes
+
+- **Model picker** now updates the status bar and /model menu immediately, even before the first prompt creates a session.
+- **Changes panel** now refreshes after the agent commits on the current branch instead of showing stale unstaged files.
+- **Background task** completions now report the full log size and read hint even when only a short prefix was captured.
+- **GitHub export** on old hibernated sessions now shows a clear message to start a new chat instead of a generic error.
+
+
+# 0.2.119 — 2026-08-02
+
+## Features
+
+- **Always allow** for bash commands now lets you edit a free-form glob pattern instead of only word-prefix scopes.
+- **Long responses** now show a clickable arrow that jumps back to the start of the answer.
+- **Auto mode** now auto-approves more common read-only git commands and harmless file appends.
+- **Plan previews** now show Mermaid diagram buttons (Open Image, Copy Image Path, Copy Source).
+
+## Bug Fixes
+
+- **Gateway connections** now detect and recover from dead sockets more reliably.
+- **Question cards** now let you Tab through answers instead of losing focus to the scrollback.
+- **Resume picker** no longer tries to load a session from pasted garbage when you press Enter.
+- **Background task** completion messages no longer grow unbounded when the task produced a huge log.
+- **Plan viewer scrollbar** now responds to clicks on the border column and renders without dark stripes in Terminal.app.
+- **Expired external auth provider** credentials now correctly trigger the interactive sign-in flow instead of a silent 401 loop.
+
+## Performance
+
+- **/btw** side questions now reuse the parent session’s cached prefix for faster responses.
+- **Doctor** and tmux-backed startup are now faster when no live tmux processes remain.
+
+
+# 0.2.118 — 2026-07-31
+
+## Features
+
+- **Sessions** can now be permanently deleted from the dashboard by pressing Ctrl+X twice on an idle row, or from the welcome list with d then y.
+- **Keyboard shortcuts help** (Ctrl+.) now shows how to browse prompt history and search the conversation.
+- **grok doctor** now warns when tmux is reducing colors and can fix the config.
+
+## Bug Fixes
+
+- **`/btw`** now retries on temporary model overload instead of failing immediately.
+- **Session sharing** is temporarily disabled.
+- **`[stop]`** / Ctrl+C during `/compact` now cancels instead of no-opping.
+- **Automatic recaps** no longer appear twice after the same turn.
+- **Background task wait timeout** descriptions and limits now match the client's actual configured ceiling.
+- **Background tasks** no longer stay stuck as 'Running' in the tasks pane when they finish quickly.
+- **Plan mode indicator** now disappears right after approving a plan instead of lingering.
+- **Dragging the scrollbar** in the plan preview now works as expected.
+- **Compaction** now correctly handles certain context-length errors from the inference API.
+
+
+# 0.2.117 — 2026-07-30
+
+## Features
+
+- **GROK_EXTRA_CA_BUNDLE** env var allows adding custom TLS root certificates.
+
+## Bug Fixes
+
+- **Stop command** now terminates all background subagents from prior turns.
+- **kill_task** tool now correctly reports when a task does not exist over ACP connections.
+- **get_task_output** no longer waits the full timeout for already-finished tasks over ACP.
+- **/usage** command and billing UI are hidden for enterprise auth setups.
+- **Plan approval** no longer starts Build when pressing Enter without notes in revise mode.
+
+## Performance
+
+- **Terminal resize** is much faster on long conversations in fullscreen mode.
+
+
+# 0.2.116 — 2026-07-30
+
+## Features
+
+- **Headless streaming output** now includes tool calls, results, and usage when using `--output-format streaming-json`.
+- **New `/undo` slash command** restores files and chat to an earlier turn, same as `/rewind`.
+- **Slash commands** are now correctly hidden or refused in minimal or fullscreen mode based on their declared support.
+
+## Bug Fixes
+
+- **Fixed repeated forced re-logins** after laptop sleep or network hiccups during token refresh.
+- **Suppressed spurious history load warnings** on draft conversations that have no server history yet.
+- **Settings enum pickers** now keep the selected radio button on the current value until you press Enter.
+- **Deep-linked settings** such as `/privacy` now close the settings modal on Esc or Enter instead of returning to the list.
+
+
+# 0.2.115 — 2026-07-29
+
+## Features
+
+- **Delete sessions from the dashboard and welcome list.** On the dashboard, press `Ctrl+X` twice (or hover a settled row and click `[✗]` twice); in the welcome and `/resume` lists, press `d` then `y`.
+
+## Bug Fixes
+
+- **Fixed chat history corruption** that could duplicate tool results or cause later 400 errors after repeated identical tool calls.
+- **Fixed infinite redirect loops** in embedded previews when the browser blocks the required cookie.
+- **Improved the action-stationarity nudge message** to avoid incorrectly claiming tool results were identical.
+- **Fixed external auth provider commands** (`auth_provider_command`) not working on Windows.
+- **Fixed incorrect 'Turn cancelled by user' messages** shown on internal send-now wake turns.
+- **Fixed language server crashes** (e.g. Roslyn on every edit) and missing C# diagnostics; improved diagnostics reliability for other servers.
+
+## Performance
+
+- **Improved prompt caching** for long conversations, reducing repeated billing on growing transcripts.
+
+# 0.2.114 — 2026-07-29
+
+## Features
+
+- **New `/delete` slash command** removes the current session's history after confirmation.
+
+## Bug Fixes
+
+- **Grok** no longer crashes on startup when the host machine has no free threads.
+
+
+# 0.2.113 — 2026-07-28
+
+## Features
+
+- **MCP servers** can now be enabled or disabled directly from the CLI with `grok mcp enable <name>` and `grok mcp disable <name>`.
+- **Full plan markdown** can now be copied to the clipboard with `y` during plan approval or preview.
+- **Added support for the new SuperGrok Plus subscription tier** in authentication and feature gating.
+- **Enabled automatic recovery** from repetitive loops in model output by default.
+
+## Bug Fixes
+
+- **Terminal command output** is no longer lost or duplicated when the gateway is unreachable.
+- **Invalid MCP server entries** in config.toml no longer prevent Grok from starting; problems are shown in `grok inspect`.
+- **SessionEnd hooks** now run on exit in non-leader TUI and headless sessions.
+- **Paste chips** now display with the correct background in inline prompts and question inputs.
+- **Pasted content chips** now behave consistently when editing answers in the question view.
+- **Background task status** now shows only elapsed duration instead of absolute timestamps.
+- **Session lists** no longer drop real sessions when the remote registry reports an outdated turn count of zero.
+- **/loop** now stores prompts that include stop conditions so recurring tasks can terminate themselves when done.
+- **Reduced spurious warning messages** for common auth and config scenarios.
+- **Fixed conda activation** (and other sourced scripts that read $@) when using persistent or login-capture shells.
+- **Fixed stuck background-task tray rows** after long foreground shell commands complete.
+- **Agent subprocesses and idle inhibitors** are now cleaned up when the parent CLI process dies unexpectedly.
+- **Fixed truncated plans** in minimal mode and improved visual separation between reasoning and output (including NO_COLOR).
+- **Fixed credential loss** across multiple grok processes sharing the same auth file.
+- **Fixed doubled Enter** and other keys on older Alacritty terminals.
+- **Fixed false paywall** messages for free-tier and unmatched users.
+
+## Performance
+
+- **Cold start** shows the UI instantly while models and settings load in the background.
+- **Large session forks and resumes** now use far less memory and avoid spikes.
+- **Prevented thread exhaustion** on high-core shared machines by limiting the workspace daemon's worker threads.
+
+
+# 0.2.112 — 2026-07-24
+
+## Breaking Changes
+
+- **CLI version policy** now has separate soft update floors/ceilings and hard startup requirements.
+
+## Features
+
+- **New /tutorial slash command** opens an opt-in nine-topic onboarding tour of Grok.
+- **New tool_overrides option** lets you set date cutoffs and domain allowlists for the agent's built-in search tools.
+- **New toolOverrides option** lets you set date cutoffs and domain allowlists for the agent's built-in search tools.
+- **New config options** let you add query parameters or environment-backed headers to custom model providers and control which variables reach shell tools.
+- **Terminal and environment fixes** are now consolidated under the `/doctor` command with clearer guidance.
+- **Marketplace add** now rejects non-git URLs at add time instead of failing later.
+- **Slash commands** can now show optional bracket tags (e.g. [new]) via config or remote settings.
+- **Queued prompts** now offer an [edit] mouse button alongside Send now and cancel.
+- **Voice shortcut** toggle in settings can disable the Ctrl+Space/F8 keybind without disabling voice entirely.
+- **Image edit** can now use a remotely configured model slug instead of the hardcoded default.
+- **`grok doctor fix`** can now repair common tmux clipboard and passthrough problems.
+- **Per-provider auth helpers** now work on Windows and can run from a configurable working directory.
+- **/resume** now shows only native Grok sessions by default and shows a hint when external sessions are hidden.
+- **`grok --resume`** can now resume a session by its title as well as by ID.
+- **Workflows overlay** now shows live per-agent progress and automatically follows the active phase.
+- **Workflow runs** that failed can now be resumed; scratch file limits were also increased.
+- **Hooks** can now be defined in config.toml in addition to JSON files.
+- **Clicking** the "still running" status now opens the tasks pane.
+
+## Bug Fixes
+
+- **File attachments** now appear correctly when resuming or replaying conversations.
+- **Terminal output** from remote clients is now recorded so read-file hints and monitors function correctly.
+- **Background shell commands** now correctly report their real exit codes instead of always showing -1.
+- **Marketplace source refreshes** no longer hang the TUI or trap you in the extensions modal.
+- **Background task tray** now correctly clears killed tasks and keeps task descriptions after reconnect.
+- **Dashboard overlay** now correctly returns after forking a dashboard-attached session.
+- **Linux voice dictation** now works on PipeWire versions before 1.6.
+- **Fork** from a rewound session now copies the correct live-branch history.
+- **Account pane** now shows name and email even after the access token expires.
+- **Voice mode** now lets you edit already-dictated text without closing the microphone.
+- **Fixed startup hangs** on Linux after concurrent launches or rapid restarts.
+- **MCP tools** now appear without restart after enrolling or updating a managed service.
+- **Plugin subagents** now see the same MCP tools as the parent session.
+- **Copy confirmations** now show shorter messages when the clipboard succeeds.
+- **Repeated identical tool calls** now end the turn silently instead of showing a stop banner.
+- **Web search** now defaults to grok-4.5.
+- **Voice dictation** text is no longer dropped when pressing Enter to send.
+- **Bash mode** (`!`) now shows yellow prefix and action label in minimal mode.
+- **Parked turns** no longer spam duplicate "Worked for" markers in the transcript.
+
+
+# 0.2.111 — 2026-07-22
+
+## Features
+
+- Users can now disable image generation and video generation tools (and their slash commands) via config.toml or environment variables.
+- `/session-info` now displays whether the session uses OAuth or an API key and where to manage the account.
+- You can now run `grok doctor fix` commands directly from inside the TUI instead of only from the CLI.
+
+## Bug Fixes
+
+- **Plugin subagents** now inherit the parent session’s connected MCP servers (default `mcpInheritance: all`), so `search_tool` / `use_tool` work the same as for local agents. Plugin agents still cannot declare their own MCP servers, hooks, or elevated permission modes.
+- **`!cmd` commands** now allow up to one hour before timing out.
+- **npm package** now installs the native binary under `$GROK_HOME/bin` (honoring the same override as the Rust CLI).
+- **Startup warnings** now point to `/doctor` for details and fixes.
+- **Dashboard hover and clicks** no longer miss the gaps between items in wide mode.
+- **Shift/Alt+Enter** now inserts a newline while editing a queued prompt.
+- **Queued prompt edits** under combine mode no longer lose changes due to premature hold release.
+- Forking a session that used compaction no longer causes later rewinds to fail with missing checkpoint errors.
+- When a permission prompt appears while viewing scrollback, focus now correctly moves to the prompt so you can answer.
+- Pressing Esc once now cancels the current agent turn (except in fullscreen vim scrollback mode).
+- Grok now automatically stops a turn that keeps repeating the exact same tool call many times in a row.
+- Configs using either spelling of the workspace teleport disable flag now load and save correctly.
+- Background subagent completion messages no longer leak into unrelated sessions when multiple sessions are active.
+- When the auto-permission classifier times out or fails, Grok now shows a normal permission prompt instead of silently denying.
+- **Managed MCP tools** no longer time out prematurely on slow operations like Notion updates.
+
+## Performance
+
+- Voice dictation on macOS now uses less memory by running capture in a temporary helper process.
+
+
+# 0.2.110 — 2026-07-21
+
+## Features
+
+- **Removing MCP servers, plugins, or hook sources** in the Extensions modal now asks for confirmation (press y to proceed).
+
+## Bug Fixes
+
+- **Session creation failures** (including disk full) now show an error message instead of hanging on "Starting session…".
+- **Auto-compact** that fails due to an expired token now lets you log in and automatically retry the compact + original prompt.
+
+
+# 0.2.109 — 2026-07-21
+
+## Features
+
+- **/usage** now shows token counts and cost for the current session.
+- **grok doctor fix ssh-wrap** can set up `grok wrap ssh` automatically for Bash, zsh, and fish.
+- **[model_providers.<id>]** lets operators share gateway settings across custom models.
+- **Reasoning effort** now accepts `max` as its own tier (above `xhigh`) when the model advertises it.
+- **Queued follow-ups** can now be batched into a single model turn with the new combine_queued_prompts setting.
+- **/doctor** is now the main in-app command for checking terminal, tmux, clipboard, and keyboard setup.
+- **read_file** now returns full Markdown files inside skills/ directories without truncation.
+
+## Bug Fixes
+
+- **Voice dictation** now explains when the microphone delivered only silence (macOS permission) versus no speech detected.
+- **Duplicate 'Worked for' markers** no longer stack in the transcript when background tasks defer during a parked turn.
+- The idle status row now clearly says '1 subagent still running' instead of 'watching · 1 subagent' when background work remains.
+- **Background /loop** iterations no longer overlap when descendant subagents are still running.
+
+
+# 0.2.108 — 2026-07-21
+
+## Features
+
+- **Sessions** can now be resumed after moving the working directory or switching machines.
+- **Ctrl+G** in minimal mode opens the current prompt draft in an external editor without sending it; fullscreen keeps the tasks pane.
+- **grok doctor** checks terminal, tmux, clipboard, and keyboard setup without opening the TUI.
+
+## Bug Fixes
+
+- **Image paste** over grok wrap now works on headless remotes.
+
+# 0.2.107 — 2026-07-20
+
+## Features
+
+- **Stop hooks** can now keep the agent running by feeding feedback back to the model instead of ending the turn.
+- **Custom models** can now authenticate using rotating tokens fetched from a command, similar to credential helpers.
+- **Feedback** now includes author details when provided, helping with follow-up.
+- **Sessions** can now resume across hosts by mirroring transcripts to external storage like S3.
+- **Sessions** can now be imported and resumed from mirrored state across hosts.
+- **Auto mode** now continues after classifier blocks by telling the agent the reason, escalating only after repeated denials.
+- **Session storage** can now flush after every frame (eager mode) instead of only at turn end.
+
+## Bug Fixes
+
+- **Ctrl+B** now backgrounds running commands; **Ctrl+G** toggles the tasks pane.
+- **OAuth popups** in live preview now redirect correctly after login.
+- **Git status** shown to the model at startup now includes unstaged and untracked files.
+- **Tool descriptions** now stay correct when parameter names are randomized.
+- **Minimal mode** now shows full reasoning in scrollback and collapses successful lookup results to one-line headers.
+- **Empty commands** like `true` or bare `echo` now remind the model to stop and wait for background work instead of spinning.
+
+## Performance
+
+- **Recap summaries** after idle now load much faster by reusing the previous turn's cached context.
+
+
 # 0.2.106 — 2026-07-18
 
 ## Features

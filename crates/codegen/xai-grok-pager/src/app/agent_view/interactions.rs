@@ -20,6 +20,14 @@ use crate::views::question_view::QUESTION_VIEW_HPAD;
 use crossterm::event::Event;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::time::Instant;
+/// Which neighbouring question a key asked for, and where its cursor lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuestionSwitch {
+    Next,
+    Prev,
+    TabForward,
+    TabBackward,
+}
 impl AgentView {
     /// Handle key input when the permission view is active.
     ///
@@ -130,14 +138,75 @@ impl AgentView {
                     }
                     return InputOutcome::Changed;
                 }
+                let on_reject_once = perm.options.get(perm.active_idx).is_some_and(|o| {
+                    o.kind == agent_client_protocol::PermissionOptionKind::RejectOnce
+                });
+                if key.code == KeyCode::Char('e')
+                    && key.modifiers.is_empty()
+                    && perm.has_editable_bash_pattern()
+                    && !on_reject_once
+                    && let Some(idx) = perm.options.iter().position(|o| {
+                        o.kind == agent_client_protocol::PermissionOptionKind::AllowAlways
+                    })
+                {
+                    perm.active_idx = idx;
+                    let initial = crate::views::permission_view::preview_command_text(perm);
+                    self.permission_pattern_edit = Some(
+                        crate::views::permission_view::PatternEditState::new(initial),
+                    );
+                    perm.focus = PermissionFocus::PatternEdit;
+                    return InputOutcome::Changed;
+                }
                 if let Some(opt) = perm.options.get(perm.active_idx)
                     && opt.kind == agent_client_protocol::PermissionOptionKind::RejectOnce
                     && crate::input::key::is_text_input_key(key)
-                    && matches!(key.code, KeyCode::Char(c) if ! c.is_ascii_digit())
+                    && matches!(key.code, KeyCode::Char(c) if !c.is_ascii_digit())
                 {
                     perm.focus = PermissionFocus::FollowupInput;
                     let _ = self.prompt.handle_key(key);
                     return InputOutcome::Changed;
+                }
+                InputOutcome::Changed
+            }
+            PermissionFocus::PatternEdit => {
+                if key.code == KeyCode::Esc {
+                    self.permission_pattern_edit = None;
+                    perm.focus = PermissionFocus::Options;
+                    return InputOutcome::Changed;
+                }
+                if key!('c', CONTROL).matches(key) {
+                    return InputOutcome::Action(Action::PermissionCancel);
+                }
+                let Some(edit) = self.permission_pattern_edit.as_mut() else {
+                    perm.focus = PermissionFocus::Options;
+                    return InputOutcome::Changed;
+                };
+                if key.code == KeyCode::Enter {
+                    if edit.trimmed().is_some()
+                        && let Some(opt) = perm.options.iter().find(|o| {
+                            o.kind == agent_client_protocol::PermissionOptionKind::AllowAlways
+                        })
+                    {
+                        return InputOutcome::Action(Action::PermissionSelect(
+                            opt.option_id.clone(),
+                        ));
+                    }
+                    return InputOutcome::Changed;
+                }
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let alt = key.modifiers.contains(KeyModifiers::ALT);
+                match key.code {
+                    KeyCode::Backspace => edit.backspace(),
+                    KeyCode::Delete => edit.delete(),
+                    KeyCode::Left => edit.move_left(),
+                    KeyCode::Right => edit.move_right(),
+                    KeyCode::Home => edit.move_home(),
+                    KeyCode::End => edit.move_end(),
+                    KeyCode::Char('a') if ctrl => edit.move_home(),
+                    KeyCode::Char('e') if ctrl => edit.move_end(),
+                    KeyCode::Char('u') if ctrl => edit.clear(),
+                    KeyCode::Char(c) if !ctrl && !alt => edit.insert_char(c),
+                    _ => {}
                 }
                 InputOutcome::Changed
             }
@@ -174,6 +243,7 @@ impl AgentView {
                 InputOutcome::Action(Action::CancelTurnChoice(choice))
             }
             KeyCode::Esc => {
+                self.suppress_rewind_arm(std::time::Instant::now());
                 InputOutcome::Action(Action::CancelTurnChoice(CancelTurnChoice::ContinueToRun))
             }
             _ => InputOutcome::Unchanged,
@@ -223,12 +293,13 @@ impl AgentView {
     /// Handle key input when the question view is active.
     ///
     /// Two modes:
-    /// - **Navigation**: j/k move cursor, Space toggles, Enter advances or
-    ///   edits freeform, h/l/[/] cycle questions, 1-9/a-f jump+toggle,
-    ///   n next, s skip, Shift-X kill (only explicit way to dismiss).
+    /// - **Navigation**: j/k move the cursor between answers and Tab/Shift+Tab
+    ///   walk the same rows in a loop, Space toggles, Enter advances or edits
+    ///   freeform, h/l/[/] cycle questions, 1-9/a-f jump+toggle, Esc unselects,
+    ///   Shift-X kills the question tool.
     /// - **InputMode**: all keys go to the prompt widget; Esc exits input mode.
     pub(super) fn handle_question_key(&mut self, key: &KeyEvent) -> InputOutcome {
-        use crate::views::question_view::{QuestionFocus, QuestionSelection};
+        use crate::views::question_view::{CursorMotion, QuestionFocus};
         let Some(ref mut qv) = self.question_view else {
             return InputOutcome::Unchanged;
         };
@@ -263,6 +334,7 @@ impl AgentView {
                             }
                         }
                         qv.focus = QuestionFocus::Navigation;
+                        self.last_prompt_click_ms = None;
                     }
                     return InputOutcome::Changed;
                 }
@@ -271,11 +343,11 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 if key!('y', CONTROL).matches(key) {
-                    self.dismiss_question_view();
-                    return InputOutcome::Changed;
+                    return self.dismiss_question_view();
                 }
                 if key!('c', CONTROL).matches(key) {
                     qv.focus = QuestionFocus::Navigation;
+                    self.last_prompt_click_ms = None;
                     return InputOutcome::Changed;
                 }
                 match self.prompt.route_enter(key) {
@@ -306,6 +378,7 @@ impl AgentView {
                             }
                         }
                         qv.focus = QuestionFocus::Navigation;
+                        self.last_prompt_click_ms = None;
                         let last = qv.questions.len().saturating_sub(1);
                         if qv.active_tab < last {
                             self.swap_question_freeform();
@@ -333,8 +406,7 @@ impl AgentView {
             }
             QuestionFocus::Navigation => {
                 if key!('y', CONTROL).matches(key) {
-                    self.dismiss_question_view();
-                    return InputOutcome::Changed;
+                    return self.dismiss_question_view();
                 }
                 if key!('c', CONTROL).matches(key) {
                     return self.submit_question_answers(true);
@@ -344,13 +416,13 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 let mut needs_scroll_update = false;
-                let mut needs_switch_question: Option<bool> = None;
+                let mut needs_switch_question: Option<QuestionSwitch> = None;
                 if qv.is_on_freeform_row()
                     && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
                     && matches!(key.code, KeyCode::Char(c) if c != ' ')
                 {
                     let text = qv.activate_freeform_input();
-                    self.prompt.set_text(&text);
+                    self.prompt.set_text_preserving(&text);
                     let _ = self.prompt.handle_key(key);
                     return InputOutcome::Changed;
                 }
@@ -358,57 +430,43 @@ impl AgentView {
                     KeyCode::Char('j') | KeyCode::Down
                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL =>
                     {
-                        let max = qv.total_items(qv.active_tab).saturating_sub(1);
-                        let cur = qv.cursor();
-                        if cur < max {
-                            qv.set_cursor(cur + 1);
-                            needs_scroll_update = true;
-                        }
+                        qv.move_cursor(CursorMotion::Next);
+                        needs_scroll_update = true;
                     }
                     KeyCode::Char('k') | KeyCode::Up
                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL =>
                     {
-                        let cur = qv.cursor();
-                        if cur > 0 {
-                            qv.set_cursor(cur - 1);
-                            needs_scroll_update = true;
-                        }
-                    }
-                    KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-                        let max = qv.total_items(qv.active_tab).saturating_sub(1);
-                        let half = (max / 2).max(1);
-                        qv.set_cursor((qv.cursor() + half).min(max));
+                        qv.move_cursor(CursorMotion::Prev);
                         needs_scroll_update = true;
                     }
-                    KeyCode::PageDown => {
-                        let max = qv.total_items(qv.active_tab).saturating_sub(1);
-                        let page = max.max(1);
-                        qv.set_cursor((qv.cursor() + page).min(max));
+                    KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+                        qv.move_cursor(CursorMotion::HalfPageDown);
                         needs_scroll_update = true;
                     }
                     KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                        let half = (qv.total_items(qv.active_tab) / 2).max(1);
-                        qv.set_cursor(qv.cursor().saturating_sub(half));
+                        qv.move_cursor(CursorMotion::HalfPageUp);
+                        needs_scroll_update = true;
+                    }
+                    KeyCode::PageDown => {
+                        qv.move_cursor(CursorMotion::PageDown);
                         needs_scroll_update = true;
                     }
                     KeyCode::PageUp => {
-                        let page = qv.total_items(qv.active_tab).saturating_sub(1).max(1);
-                        qv.set_cursor(qv.cursor().saturating_sub(page));
+                        qv.move_cursor(CursorMotion::PageUp);
                         needs_scroll_update = true;
                     }
                     KeyCode::Char('g') if key.modifiers.is_empty() => {
-                        qv.set_cursor(0);
+                        qv.move_cursor(CursorMotion::First);
                         needs_scroll_update = true;
                     }
                     KeyCode::Char('G') if key.modifiers == KeyModifiers::SHIFT => {
-                        let max = qv.total_items(qv.active_tab).saturating_sub(1);
-                        qv.set_cursor(max);
+                        qv.move_cursor(CursorMotion::Last);
                         needs_scroll_update = true;
                     }
                     KeyCode::Char(' ') => {
                         if qv.is_on_freeform_row() {
                             let text = qv.activate_freeform_input();
-                            self.prompt.set_text(&text);
+                            self.prompt.set_text_preserving(&text);
                         } else {
                             let active = qv.active_tab;
                             let cursor = qv.cursor();
@@ -428,7 +486,7 @@ impl AgentView {
                     KeyCode::Enter => {
                         if qv.is_on_freeform_row() {
                             let text = qv.activate_freeform_input();
-                            self.prompt.set_text(&text);
+                            self.prompt.set_text_preserving(&text);
                         } else {
                             let cursor = qv.cursor();
                             let active = qv.active_tab;
@@ -438,7 +496,7 @@ impl AgentView {
                             }
                             let last = qv.questions.len().saturating_sub(1);
                             if qv.active_tab < last {
-                                needs_switch_question = Some(true);
+                                needs_switch_question = Some(QuestionSwitch::Next);
                             } else {
                                 return self.submit_question_answers(false);
                             }
@@ -449,21 +507,21 @@ impl AgentView {
                             let freeform_idx = qv.total_items(qv.active_tab).saturating_sub(1);
                             qv.set_cursor(freeform_idx);
                             let text = qv.activate_freeform_input();
-                            self.prompt.set_text(&text);
+                            self.prompt.set_text_preserving(&text);
                         }
                     }
                     KeyCode::Char('l') | KeyCode::Char(']') | KeyCode::Right
                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL =>
                     {
                         if qv.questions.len() > 1 {
-                            needs_switch_question = Some(true);
+                            needs_switch_question = Some(QuestionSwitch::Next);
                         }
                     }
                     KeyCode::Char('h') | KeyCode::Char('[') | KeyCode::Left
                         if key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL =>
                     {
                         if qv.questions.len() > 1 {
-                            needs_switch_question = Some(false);
+                            needs_switch_question = Some(QuestionSwitch::Prev);
                         }
                     }
                     KeyCode::Char(c)
@@ -485,7 +543,7 @@ impl AgentView {
                             }
                             let last = qv.questions.len().saturating_sub(1);
                             if qv.active_tab < last {
-                                needs_switch_question = Some(true);
+                                needs_switch_question = Some(QuestionSwitch::Next);
                             } else {
                                 return self.submit_question_answers(false);
                             }
@@ -509,47 +567,46 @@ impl AgentView {
                         }
                     }
                     KeyCode::Esc => {
-                        if matches!(
-                            qv.local_kind,
-                            Some(
-                                crate::views::question_view::LocalQuestionKind::ProjectSelect { .. }
-                            )
-                        ) {
-                            return self.submit_question_answers(true);
-                        }
                         let active = qv.active_tab;
-                        if let Some(sel) = qv.selections.get_mut(active) {
-                            match sel {
-                                QuestionSelection::Multi(set) => {
-                                    set.clear();
-                                }
-                                QuestionSelection::Single(opt) => {
-                                    *opt = None;
-                                }
-                            }
-                        }
-                        if let Some(sel) = qv.per_question_freeform_selected.get_mut(active) {
-                            *sel = false;
-                        }
+                        qv.clear_selection(active);
                     }
-                    KeyCode::Tab => {
-                        self.swap_question_freeform();
-                        self.active_pane = AgentPane::Scrollback;
-                        return InputOutcome::Changed;
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let backward = crate::input::key::is_shift_tab(key);
+                        let crosses_questions = qv.questions.len() > 1;
+                        needs_scroll_update = true;
+                        match (backward, qv.is_on_first_row(), qv.is_on_last_row()) {
+                            (false, _, false) => qv.move_cursor(CursorMotion::Next),
+                            (true, false, _) => qv.move_cursor(CursorMotion::Prev),
+                            (false, _, true) if crosses_questions => {
+                                needs_switch_question = Some(QuestionSwitch::TabForward);
+                            }
+                            (true, true, _) if crosses_questions => {
+                                needs_switch_question = Some(QuestionSwitch::TabBackward);
+                            }
+                            (false, _, true) => qv.move_cursor(CursorMotion::First),
+                            (true, true, _) => qv.move_cursor(CursorMotion::Last),
+                        }
                     }
                     KeyCode::Char('X') if key.modifiers == KeyModifiers::SHIFT => {
                         return self.submit_question_answers(true);
                     }
                     _ => {}
                 }
-                if let Some(forward) = needs_switch_question {
+                if let Some(switch) = needs_switch_question {
                     self.last_question_click = None;
                     self.swap_question_freeform();
                     if let Some(ref mut qv) = self.question_view {
-                        if forward {
-                            qv.next_question();
-                        } else {
-                            qv.prev_question();
+                        match switch {
+                            QuestionSwitch::Next => qv.next_question(),
+                            QuestionSwitch::Prev => qv.prev_question(),
+                            QuestionSwitch::TabForward => {
+                                qv.wrapping_next_question();
+                                qv.move_cursor(CursorMotion::First);
+                            }
+                            QuestionSwitch::TabBackward => {
+                                qv.wrapping_prev_question();
+                                qv.move_cursor(CursorMotion::Last);
+                            }
                         }
                     }
                     self.load_question_freeform();
@@ -591,6 +648,7 @@ impl AgentView {
                             *sel = None;
                         }
                         qv.focus = crate::views::question_view::QuestionFocus::Navigation;
+                        self.last_prompt_click_ms = None;
                     }
                     let key_event = KeyEvent::new(
                         if key_ch == '\n' {
@@ -670,6 +728,11 @@ impl AgentView {
                         .contains((mouse.column, mouse.row).into())
                     {
                         let _ = self.prompt.handle_mouse(mouse);
+                        if self.prompt_click_is_double()
+                            && self.prompt.expand_paste_element_at_cursor()
+                        {
+                            self.prompt.refresh_slash(&self.session.models);
+                        }
                         return InputOutcome::Changed;
                     }
                     let idx = qv.active_tab;
@@ -688,6 +751,7 @@ impl AgentView {
                         *sel = None;
                     }
                     qv.focus = crate::views::question_view::QuestionFocus::Navigation;
+                    self.last_prompt_click_ms = None;
                 }
                 let prompt_area = self.pane_areas.prompt;
                 let footer_h = 3u16;
@@ -730,7 +794,7 @@ impl AgentView {
                             .get(active_tab)
                             .cloned()
                             .unwrap_or_default();
-                        self.prompt.set_text(&text);
+                        self.prompt.set_text_preserving(&text);
                         qv.focus = crate::views::question_view::QuestionFocus::InputMode;
                     }
                     return InputOutcome::Changed;
@@ -813,7 +877,7 @@ impl AgentView {
                             .get(tab)
                             .cloned()
                             .unwrap_or_default();
-                        self.prompt.set_text(&text);
+                        self.prompt.set_text_preserving(&text);
                         qv.focus = QuestionFocus::InputMode;
                     }
                 }
@@ -1029,21 +1093,29 @@ impl AgentView {
             .get(qv.active_tab)
             .map(|s| s.as_str())
             .unwrap_or("");
-        self.prompt.set_text(new_text);
+        self.prompt.set_text_preserving(new_text);
     }
     /// Dismiss (hide) the question view without submitting answers.
     ///
     /// Restores the original prompt text that was stashed when the question
     /// view opened, so typed "additional context" doesn't leak into the
     /// main prompt. Also clears any stashed (tab-hidden) question view.
-    fn dismiss_question_view(&mut self) {
+    fn dismiss_question_view(&mut self) -> InputOutcome {
+        let is_doctor_fix = self.question_view.as_ref().is_some_and(|qv| {
+            matches!(
+                qv.local_kind,
+                Some(crate::views::question_view::LocalQuestionKind::DoctorFix { .. })
+            )
+        });
+        if is_doctor_fix {
+            return self.submit_question_answers(true);
+        }
         if let Some(qv) = self.question_view.take() {
-            self.turn_paused_duration += qv.opened_at.elapsed();
+            self.record_question_pause(&qv);
             self.prompt.restore(qv.stashed_prompt);
         }
-        self.hovered_question_item = None;
-        self.inline_prompt_area = None;
-        self.last_question_click = None;
+        self.cleanup_question_state();
+        InputOutcome::Changed
     }
     /// Retract an interaction modal (permission / question / plan-approval) that
     /// another connected client already resolved.
@@ -1063,7 +1135,7 @@ impl AgentView {
             .as_ref()
             .is_some_and(|qv| qv.tool_call_id == tool_call_id)
         {
-            self.dismiss_question_view();
+            let _ = self.dismiss_question_view();
             return true;
         }
         if self
@@ -1106,15 +1178,31 @@ impl AgentView {
     pub(crate) fn submit_question_answers_for_test(&mut self, skipped: bool) -> InputOutcome {
         self.submit_question_answers(skipped)
     }
+    #[cfg(test)]
+    pub(crate) fn handle_question_key_for_test(&mut self, key: &KeyEvent) -> InputOutcome {
+        self.handle_question_key(key)
+    }
     fn submit_question_answers(&mut self, skipped: bool) -> InputOutcome {
         use xai_grok_tools::implementations::grok_build::ask_user_question::AskUserQuestionExtResponse;
         self.swap_question_freeform();
         let Some(mut qv) = self.question_view.take() else {
             return InputOutcome::Changed;
         };
-        self.turn_paused_duration += qv.opened_at.elapsed();
+        self.record_question_pause(&qv);
         if let Some(kind) = qv.local_kind.take() {
-            let outcome = translate_local_submit(&qv, kind, skipped);
+            let is_doctor_fix = matches!(
+                kind,
+                crate::views::question_view::LocalQuestionKind::DoctorFix { .. }
+            );
+            let outcome = if skipped && is_doctor_fix {
+                let crate::views::question_view::LocalQuestionKind::DoctorFix { target, .. } = kind
+                else {
+                    unreachable!("doctor fix checked above")
+                };
+                InputOutcome::Action(Action::DoctorFixCancelled(target))
+            } else {
+                translate_local_submit(&qv, kind, skipped)
+            };
             self.prompt.restore(qv.stashed_prompt);
             self.cleanup_question_state();
             return outcome;
@@ -1172,6 +1260,7 @@ impl AgentView {
         self.hit_question_scrollbar.clear();
         self.inline_prompt_area = None;
         self.last_question_click = None;
+        self.last_prompt_click_ms = None;
     }
     /// Answer the ACTIVE question of this agent's pending
     /// `AskUserQuestion` from the dashboard peek panel.
@@ -1228,7 +1317,7 @@ impl AgentView {
             self.question_view = Some(qv);
             return PeekAnswerOutcome::Advanced;
         }
-        self.turn_paused_duration += qv.opened_at.elapsed();
+        self.record_question_pause(&qv);
         let response = qv.build_accepted_response();
         qv.send_ext_response(response);
         self.prompt.restore(qv.stashed_prompt);
@@ -1281,6 +1370,7 @@ mod cancel_turn_mouse_tests {
                 bg_tool_call_to_task: std::collections::HashMap::new(),
                 scheduled_tasks: std::collections::HashMap::new(),
                 in_flight_prompt: None,
+                compact_held_prompt: None,
                 current_prompt_id: None,
                 created_via_new: false,
             },
@@ -1376,6 +1466,28 @@ mod cancel_turn_mouse_tests {
         let mut agent = make_agent();
         let outcome = agent.handle_cancel_turn_mouse(&down(10, 10));
         assert!(matches!(outcome, InputOutcome::Unchanged));
+    }
+    #[test]
+    fn esc_confirm_refreshes_expired_rewind_grace() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::time::Instant;
+        let mut agent = make_agent();
+        agent.session.state = AgentState::TurnRunning;
+        setup_panel(&mut agent);
+        agent.rewind_suppress_deadline = Some(Instant::now());
+        let outcome =
+            agent.handle_cancel_turn_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(
+                outcome,
+                InputOutcome::Action(Action::CancelTurnChoice(CancelTurnChoice::ContinueToRun))
+            ),
+            "panel Esc must confirm the parent-turn cancel, got {outcome:?}"
+        );
+        assert!(
+            agent.rewind_arm_suppressed(Instant::now()),
+            "the Esc-confirmed cancel must refresh the post-cancel grace"
+        );
     }
 }
 #[cfg(test)]
@@ -1638,7 +1750,7 @@ mod question_no_freeform_tests {
             id: None,
         }
     }
-    fn open_question(agent: &mut AgentView, no_freeform: bool) {
+    pub(super) fn open_question(agent: &mut AgentView, no_freeform: bool) {
         let state = QuestionViewState::new(
             "tc-upsell".into(),
             vec![upsell_question()],
@@ -1652,7 +1764,7 @@ mod question_no_freeform_tests {
     }
     /// Draw one 80x30 frame so `pane_areas` and `question_scroll_region`
     /// hold the real rendered layout the mouse handler hit-tests against.
-    fn draw_frame(agent: &mut AgentView) {
+    pub(super) fn draw_frame(agent: &mut AgentView) {
         let area = Rect::new(0, 0, 80, 30);
         let reg = ActionRegistry::defaults();
         let bundle = crate::app::bundle::BundleState::default();
@@ -1666,19 +1778,15 @@ mod question_no_freeform_tests {
             &mut scratch,
             None,
             false,
-            0,
-            &[],
-            &std::collections::BTreeSet::new(),
-            None,
+            crate::app::agent_view::BannerSlotParams::none(),
             &bundle,
             false,
+            false,
             &mut Vec::new(),
-            false,
-            false,
-            None,
+            crate::app::agent_view::AppRenderParams::default(),
         );
     }
-    fn down(col: u16, row: u16) -> MouseEvent {
+    pub(super) fn down(col: u16, row: u16) -> MouseEvent {
         MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: col,
@@ -1694,7 +1802,7 @@ mod question_no_freeform_tests {
             modifiers: KeyModifiers::empty(),
         }
     }
-    fn qv(agent: &AgentView) -> &QuestionViewState {
+    pub(super) fn qv(agent: &AgentView) -> &QuestionViewState {
         agent.question_view.as_ref().expect("question view open")
     }
     /// Clicking the empty rows under the last option (option gap, footer)
@@ -1804,5 +1912,331 @@ mod question_no_freeform_tests {
         let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
         let _ = agent.handle_question_key(&z);
         assert_eq!(qv(&agent).focus, QuestionFocus::InputMode);
+    }
+}
+#[cfg(test)]
+mod question_freeform_chip_tests {
+    //! Paste-chip round trip through the question freeform input:
+    //! re-entering input mode used to reload the unchanged draft with a
+    //! wholesale `set_text`, expanding every chip into raw text.
+    use super::super::test_fixtures::make_agent;
+    use super::question_no_freeform_tests::{down, draw_frame, open_question, qv};
+    use crate::app::agent_view::AgentView;
+    use crate::views::prompt_widget::KIND_PASTE;
+    use crate::views::question_view::QuestionFocus;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    const PASTE: &str = "line 1\nline 2\nline 3\nline 4\nline 5";
+    fn paste_chip_count(agent: &AgentView) -> usize {
+        agent
+            .prompt
+            .textarea()
+            .elements()
+            .iter()
+            .filter(|e| e.kind == KIND_PASTE)
+            .count()
+    }
+    /// Multi-line paste folds into a chip; Esc out and Enter back in must
+    /// keep the chip folded (not raw expanded text), and the string slot
+    /// keeps the full paste for the submit payload.
+    #[test]
+    fn paste_chip_survives_input_mode_round_trip() {
+        let mut agent = make_agent();
+        open_question(&mut agent, false);
+        let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&z);
+        assert_eq!(qv(&agent).focus, QuestionFocus::InputMode);
+        let _ = agent.prompt.handle_paste(PASTE);
+        assert_eq!(paste_chip_count(&agent), 1, "paste must fold into a chip");
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&esc);
+        assert_eq!(qv(&agent).focus, QuestionFocus::Navigation);
+        assert_eq!(qv(&agent).per_question_freeform[0], PASTE);
+        assert!(qv(&agent).per_question_freeform_selected[0]);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&enter);
+        assert_eq!(qv(&agent).focus, QuestionFocus::InputMode);
+        assert_eq!(
+            paste_chip_count(&agent),
+            1,
+            "re-entering input mode must keep the folded chip"
+        );
+        assert_eq!(agent.prompt.text(), PASTE, "buffer text must round-trip");
+    }
+    /// A slot rewritten by another surface (e.g. the dashboard peek answer
+    /// path) no longer matches the live draft, so re-entry must take the
+    /// normal `set_text` path and show the rewritten slot.
+    #[test]
+    fn rewritten_slot_replaces_stale_draft() {
+        let mut agent = make_agent();
+        open_question(&mut agent, false);
+        let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&z);
+        let _ = agent.prompt.handle_paste(PASTE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&esc);
+        agent.question_view.as_mut().unwrap().per_question_freeform[0] = "peek answer".to_string();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&enter);
+        assert_eq!(qv(&agent).focus, QuestionFocus::InputMode);
+        assert_eq!(
+            agent.prompt.text(),
+            "peek answer",
+            "a stale draft must not shadow the rewritten slot"
+        );
+        assert_eq!(paste_chip_count(&agent), 0);
+    }
+    /// Double-click on the chip inside the question freeform input expands
+    /// it, exactly like the main prompt; a single click must not.
+    #[test]
+    fn double_click_expands_chip_in_question_input() {
+        let mut agent = make_agent();
+        open_question(&mut agent, false);
+        let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&z);
+        let _ = agent.prompt.handle_paste(PASTE);
+        assert_eq!(paste_chip_count(&agent), 1);
+        draw_frame(&mut agent);
+        let ta = agent.prompt.textarea_area();
+        assert!(ta.area() > 0, "inline textarea must have rendered");
+        let (col, row) = (ta.x + 2, ta.y);
+        let _ = agent.handle_question_mouse(&down(col, row));
+        assert_eq!(
+            paste_chip_count(&agent),
+            1,
+            "a single click must not expand the chip"
+        );
+        let _ = agent.handle_question_mouse(&down(col, row));
+        assert_eq!(
+            paste_chip_count(&agent),
+            0,
+            "double-click must expand the chip"
+        );
+        assert_eq!(agent.prompt.text(), PASTE, "content inlined as plain text");
+        assert_eq!(
+            qv(&agent).focus,
+            QuestionFocus::InputMode,
+            "expanding must not leave input mode"
+        );
+    }
+    /// A textarea click from before leaving InputMode must not pair with
+    /// the first click after re-entry as a double-click (exits clear the
+    /// pairing timer).
+    #[test]
+    fn click_before_exit_does_not_pair_with_click_after_reentry() {
+        let mut agent = make_agent();
+        open_question(&mut agent, false);
+        let z = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&z);
+        let _ = agent.prompt.handle_paste(PASTE);
+        draw_frame(&mut agent);
+        let ta = agent.prompt.textarea_area();
+        let (col, row) = (ta.x + 2, ta.y);
+        let _ = agent.handle_question_mouse(&down(col, row));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&esc);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let _ = agent.handle_question_key(&enter);
+        let _ = agent.handle_question_mouse(&down(col, row));
+        assert_eq!(paste_chip_count(&agent), 1, "chip must stay folded");
+    }
+}
+#[cfg(test)]
+mod question_answer_focus_tests {
+    //! The question card's answer walk. Tab used to hand focus to the
+    //! scrollback while the card stayed drawn; these pin the walk that
+    //! replaced it.
+    use super::super::test_fixtures::make_agent;
+    use super::super::{AgentPane, AgentView};
+    use super::question_no_freeform_tests::open_question;
+    use crate::actions::ActionRegistry;
+    use crate::app::app_view::InputOutcome;
+    use crate::views::prompt_widget::StashedPrompt;
+    use crate::views::question_view::{QuestionFocus, QuestionSelection, QuestionViewState};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use xai_grok_tools::implementations::grok_build::ask_user_question::{
+        Question, QuestionOption,
+    };
+    fn question(prompt: &str, labels: &[&str]) -> Question {
+        Question {
+            question: prompt.into(),
+            options: labels
+                .iter()
+                .map(|label| QuestionOption {
+                    label: (*label).into(),
+                    description: "why".into(),
+                    preview: None,
+                    id: None,
+                })
+                .collect(),
+            multi_select: Some(false),
+            id: None,
+        }
+    }
+    fn open_two_questions(agent: &mut AgentView) {
+        agent.question_view = Some(QuestionViewState::new(
+            "tc-tab".into(),
+            vec![
+                question("First?", &["Alpha", "Beta"]),
+                question("Second?", &["Gamma", "Delta"]),
+            ],
+            StashedPrompt::default(),
+        ));
+    }
+    fn press(agent: &mut AgentView, code: KeyCode, modifiers: KeyModifiers) {
+        let _ = agent.handle_question_key_for_test(&KeyEvent::new(code, modifiers));
+    }
+    fn tab(agent: &mut AgentView) {
+        press(agent, KeyCode::Tab, KeyModifiers::NONE);
+    }
+    fn qv(agent: &AgentView) -> &QuestionViewState {
+        agent.question_view.as_ref().expect("question view open")
+    }
+    /// (question index, cursor row).
+    fn stop(agent: &AgentView) -> (usize, usize) {
+        (qv(agent).active_tab, qv(agent).cursor())
+    }
+    fn hint_labels(agent: &AgentView) -> Vec<String> {
+        agent
+            .current_shortcut_hints(&ActionRegistry::defaults(), false)
+            .iter()
+            .map(|hint| hint.label.to_string())
+            .collect()
+    }
+    #[test]
+    fn tab_walks_every_answer_and_wraps() {
+        let mut agent = make_agent();
+        open_two_questions(&mut agent);
+        let mut visited = vec![stop(&agent)];
+        for _ in 0..6 {
+            tab(&mut agent);
+            visited.push(stop(&agent));
+        }
+        assert_eq!(
+            visited,
+            vec![(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 0)],
+            "Tab visits every answer row of question 1, then question 2, then wraps"
+        );
+        assert_eq!(
+            agent.active_pane,
+            AgentPane::Prompt,
+            "the card keeps the keyboard the whole way round"
+        );
+    }
+    #[test]
+    fn tab_wraps_within_a_single_question() {
+        let mut agent = make_agent();
+        open_question(&mut agent, false);
+        for expected in [1, 2, 0] {
+            tab(&mut agent);
+            assert_eq!(stop(&agent), (0, expected));
+        }
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+    }
+    /// Both Shift+Tab encodings terminals emit walk the answers backwards.
+    #[test]
+    fn shift_tab_walks_the_answers_backwards() {
+        for (code, modifiers) in [
+            (KeyCode::BackTab, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::SHIFT),
+        ] {
+            let mut agent = make_agent();
+            open_two_questions(&mut agent);
+            for _ in 0..3 {
+                tab(&mut agent);
+            }
+            assert_eq!(stop(&agent), (1, 0), "parked on the second question");
+            press(&mut agent, code, modifiers);
+            assert_eq!(
+                stop(&agent),
+                (0, 2),
+                "Shift+Tab off the first row enters the previous question at its last row ({code:?})"
+            );
+            for _ in 0..2 {
+                press(&mut agent, code, modifiers);
+            }
+            assert_eq!(stop(&agent), (0, 0));
+            press(&mut agent, code, modifiers);
+            assert_eq!(
+                stop(&agent),
+                (1, 2),
+                "before the first answer, Shift+Tab wraps to the last one ({code:?})"
+            );
+            assert_eq!(agent.active_pane, AgentPane::Prompt);
+        }
+    }
+    #[test]
+    fn tab_from_the_scrollback_focuses_the_card() {
+        let mut agent = make_agent();
+        open_two_questions(&mut agent);
+        agent.active_pane = AgentPane::Scrollback;
+        let registry = ActionRegistry::defaults();
+        let outcome = agent
+            .handle_scrollback_key(&KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &registry);
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "Tab in the scrollback focuses the card, got {outcome:?}"
+        );
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+    }
+    #[test]
+    fn tab_skips_the_free_text_row_when_the_card_has_none() {
+        let mut agent = make_agent();
+        open_question(&mut agent, true);
+        tab(&mut agent);
+        assert_eq!(stop(&agent), (0, 1), "two options, so one step");
+        tab(&mut agent);
+        assert_eq!(
+            stop(&agent),
+            (0, 0),
+            "the last option wraps to the first when there is no free-text row"
+        );
+    }
+    #[test]
+    fn esc_unselects_and_leaves_focus_alone() {
+        let mut agent = make_agent();
+        open_two_questions(&mut agent);
+        press(&mut agent, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(
+            matches!(qv(&agent).selections[0], QuestionSelection::Single(Some(0))),
+            "Space marks the focused answer"
+        );
+        press(&mut agent, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            matches!(qv(&agent).selections[0], QuestionSelection::Single(None)),
+            "Esc clears the answer"
+        );
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        press(&mut agent, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        assert!(agent.question_view.is_some());
+    }
+    #[test]
+    fn tab_in_input_mode_stays_with_the_text_field() {
+        let mut agent = make_agent();
+        open_two_questions(&mut agent);
+        press(&mut agent, KeyCode::Char('z'), KeyModifiers::NONE);
+        assert_eq!(qv(&agent).focus, QuestionFocus::InputMode);
+        tab(&mut agent);
+        assert_eq!(
+            qv(&agent).focus,
+            QuestionFocus::InputMode,
+            "Tab must not walk the answers out from under a half-typed answer"
+        );
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+    }
+    /// The reported symptom was the bar promising one thing while Tab did
+    /// another, so the bar must name the walk at every stop.
+    #[test]
+    fn shortcut_hints_name_the_answer_walk() {
+        let mut agent = make_agent();
+        open_two_questions(&mut agent);
+        for step in 0..7 {
+            let hints = hint_labels(&agent);
+            assert!(
+                hints.contains(&"next answer".to_string()),
+                "step {step}: the bar advertises the answer walk, got {hints:?}"
+            );
+            tab(&mut agent);
+        }
     }
 }

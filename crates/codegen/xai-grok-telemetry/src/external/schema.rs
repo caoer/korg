@@ -535,6 +535,7 @@ pub(crate) const KNOWN_CLIENT_IDENTIFIERS: &[&str] = &[
     "grok-web",
     "grok-desktop",
     "grok-code-extension",
+    "grok-agent-sdk",
     "nebula",
     "zed",
 ];
@@ -1013,8 +1014,7 @@ pub fn map_yolo_toggled(ev: &events::YoloToggled) -> Option<ExternalRecord> {
     )
 }
 
-/// `SkillDispatched` → `grok_code.skill_activated`. Skill names are
-/// details-gated; only the source category exports by default.
+/// `SkillDispatched` → `grok_code.skill_activated`. Skill names are details-gated; source and trigger export by default.
 pub fn map_skill_activated(ev: &events::SkillDispatched) -> Option<ExternalRecord> {
     Some(
         ExternalRecord::event(ExternalEventName::SkillActivated)
@@ -1026,6 +1026,7 @@ pub fn map_skill_activated(ev: &events::SkillDispatched) -> Option<ExternalRecor
                     "local"
                 },
             )
+            .attr(ExternalKey::Trigger, <&'static str>::from(ev.trigger))
             .gated(
                 ExternalKey::SkillName,
                 Gate::ToolDetails,
