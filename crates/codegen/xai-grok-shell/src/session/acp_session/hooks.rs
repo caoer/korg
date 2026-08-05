@@ -99,16 +99,25 @@ fn classify(outcome: ReverseOutcome) -> (ClientHookResponse, ClientHookGateOutco
 }
 
 /// Callback ids that fire for an event, in registration order.
+///
+/// Dedupes callback ids registered in multiple matching groups (or listed
+/// twice in one group) so observe-only `x.ai/hooks/event` dispatches once —
+/// same rule as the gate path in [`SessionActor::client_gate_responses`].
+/// Without this, a host that registers the same callback under both
+/// `matcher: "Bash"` and a match-all group would run it twice on every
+/// `run_terminal_command` tool call.
 fn matching_callback_ids<'a>(
     groups: &'a [ClientHookGroup],
     match_value: Option<&str>,
 ) -> Vec<&'a str> {
+    let mut seen = std::collections::HashSet::new();
     groups
         .iter()
         .filter(|group| {
             xai_grok_hooks::matcher::matcher_allows(group.matcher.as_ref(), match_value)
         })
         .flat_map(|group| group.callback_ids.iter().map(String::as_str))
+        .filter(|callback_id| seen.insert(*callback_id))
         .collect()
 }
 
@@ -561,6 +570,44 @@ mod tests {
         assert_eq!(
             matching_callback_ids(&groups, None),
             ["bash_only", "all_a", "all_b", "read_only"]
+        );
+    }
+
+    /// Same callback id in a bash-specific group and a match-all group must
+    /// dispatch once for `run_terminal_command` (and once for any other tool
+    /// that only hits the match-all group). Mirrors the gate-path dedupe in
+    /// `client_gate_responses` so observe hooks cannot double-fire.
+    #[test]
+    fn matching_callback_ids_dedupes_across_groups() {
+        use xai_grok_hooks::matcher::HookMatcher;
+
+        let groups = vec![
+            ClientHookGroup {
+                // Claude alias: expands to also match `run_terminal_command`.
+                matcher: Some(HookMatcher::new("Bash").unwrap()),
+                callback_ids: vec!["shared".to_string(), "bash_only".to_string()],
+                timeout: None,
+            },
+            ClientHookGroup {
+                matcher: None,
+                callback_ids: vec!["shared".to_string(), "all_only".to_string()],
+                timeout: None,
+            },
+            ClientHookGroup {
+                // Duplicate listing inside one group.
+                matcher: Some(HookMatcher::new("Bash").unwrap()),
+                callback_ids: vec!["shared".to_string()],
+                timeout: None,
+            },
+        ];
+
+        assert_eq!(
+            matching_callback_ids(&groups, Some("run_terminal_command")),
+            ["shared", "bash_only", "all_only"]
+        );
+        assert_eq!(
+            matching_callback_ids(&groups, Some("list_dir")),
+            ["shared", "all_only"]
         );
     }
 }

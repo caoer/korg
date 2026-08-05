@@ -178,10 +178,13 @@ pub fn load_hooks_from_sources(
     }
 
     // Deduplicate across sources on (canonical event, command_raw, url_raw,
-    // configured_matcher) so a hook defined in several sources runs once, while
-    // hooks sharing a command/URL but differing by matcher all still run. The
-    // canonical event collapses aliases (`SubagentStop`/`SubagentEnd`). Global
-    // hooks win because they are loaded first.
+    // matcher_dedupe_key) so a hook defined in several sources runs once.
+    // `matcher_dedupe_key` collapses Claude/Grok alias spellings (`Bash` vs
+    // `run_terminal_command`) and match-all forms (`None`/`""`/`*`) so migrated
+    // configs cannot double-register the same body. Distinct matchers that
+    // truly target different tools still keep separate entries. The canonical
+    // event collapses aliases (`SubagentStop`/`SubagentEnd`). Global hooks win
+    // because they are loaded first.
     let mut hooks: HashMap<HookEventName, Vec<HookSpec>> = HashMap::new();
     let mut seen_content: std::collections::HashSet<(HookEventName, String, String, String)> =
         std::collections::HashSet::new();
@@ -190,7 +193,7 @@ pub fn load_hooks_from_sources(
             spec.event.canonical(),
             spec.command_raw.clone().unwrap_or_default(),
             spec.url_raw.clone().unwrap_or_default(),
-            spec.configured_matcher.clone().unwrap_or_default(),
+            crate::matcher::matcher_dedupe_key(spec.configured_matcher.as_deref()),
         );
         if seen_content.insert(key) {
             hooks.entry(spec.event).or_default().push(spec);
@@ -766,6 +769,32 @@ mod tests {
             hooks[0].name.starts_with("global/"),
             "first source (global) should win, got: {}",
             hooks[0].name
+        );
+    }
+
+    /// Same command under Claude `Bash` and Grok `run_terminal_command`
+    /// matchers must load once — alias expansion would otherwise fire the
+    /// body twice on every terminal tool call.
+    #[test]
+    fn deduplicates_bash_alias_matchers_with_same_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"PreToolUse":[
+                {"matcher":"Bash","hooks":[{"type":"command","command":"check.sh"}]},
+                {"matcher":"run_terminal_command","hooks":[{"type":"command","command":"check.sh"}]}
+            ]}}"#,
+        )
+        .unwrap();
+
+        let (registry, errors) =
+            load_hooks_from_sources(&[HookSource::SettingsFile(&settings)], &[]);
+        assert!(errors.is_empty());
+        assert_eq!(
+            registry.hooks_for(HookEventName::PreToolUse).len(),
+            1,
+            "Bash and run_terminal_command matchers with the same command must dedupe"
         );
     }
 

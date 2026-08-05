@@ -34,6 +34,37 @@ fn eligible_or_record_skip(
     crate::matcher::matcher_allows(spec.matcher.as_ref(), match_value)
 }
 
+/// Body identity for a single dispatch: same command+URL must not re-run when
+/// multiple matching groups both hit this tool (e.g. `matcher: Bash` and
+/// `matcher: *` both matching `run_terminal_command` after alias expansion).
+fn hook_body_key(spec: &HookSpec) -> (String, String) {
+    (
+        spec.command_raw.clone().unwrap_or_default(),
+        spec.url_raw.clone().unwrap_or_default(),
+    )
+}
+
+/// `true` if this is the first time this body has been selected in the current
+/// dispatch; otherwise record `Skipped` and return `false`.
+fn first_body_or_record_skip(
+    spec: &HookSpec,
+    seen_bodies: &mut std::collections::HashSet<(String, String)>,
+    results: &mut Vec<HookRunResult>,
+) -> bool {
+    if seen_bodies.insert(hook_body_key(spec)) {
+        return true;
+    }
+    tracing::info!(
+        hook_name = %spec.name,
+        matcher = ?spec.configured_matcher,
+        "hook skipped (same command/url already ran for this event)"
+    );
+    results.push(HookRunResult::Skipped {
+        hook_name: spec.name.clone(),
+    });
+    false
+}
+
 /// Result of a `pre_tool_use` dispatch: the final decision plus per-hook
 /// execution details (for scrollback enrichment).
 pub struct PreToolUseResult {
@@ -75,9 +106,13 @@ pub async fn dispatch_pre_tool_use(
 
     let match_value = envelope.payload.match_value().map(str::to_string);
     let mut run_results = Vec::new();
+    let mut seen_bodies = std::collections::HashSet::new();
 
     for spec in hooks {
         if !eligible_or_record_skip(spec, match_value.as_deref(), &mut run_results) {
+            continue;
+        }
+        if !first_body_or_record_skip(spec, &mut seen_bodies, &mut run_results) {
             continue;
         }
 
@@ -271,9 +306,13 @@ pub async fn dispatch_stop(
 
     let mut out = StopDispatchResult::default();
     let match_value = envelope.payload.match_value().map(str::to_string);
+    let mut seen_bodies = std::collections::HashSet::new();
 
     for spec in hooks {
         if !eligible_or_record_skip(spec, match_value.as_deref(), &mut out.results) {
+            continue;
+        }
+        if !first_body_or_record_skip(spec, &mut seen_bodies, &mut out.results) {
             continue;
         }
 
@@ -374,9 +413,13 @@ pub async fn dispatch_non_blocking(
 
     let match_value = envelope.payload.match_value().map(str::to_string);
     let mut results = Vec::with_capacity(hooks.len());
+    let mut seen_bodies = std::collections::HashSet::new();
 
     for spec in hooks {
         if !eligible_or_record_skip(spec, match_value.as_deref(), &mut results) {
+            continue;
+        }
+        if !first_body_or_record_skip(spec, &mut seen_bodies, &mut results) {
             continue;
         }
 
@@ -667,6 +710,44 @@ mod tests {
         let skipped =
             dispatch_pre_tool_use(&registry, &pre_tool_use_envelope("read_file"), &run_ctx()).await;
         assert_eq!(skipped.decision, HookDecision::Allow);
+    }
+
+    /// Same command body under `Bash` and match-all must not double-run when
+    /// the tool is `run_terminal_command` (both matchers hit after alias
+    /// expansion). Residual gap after load-time dedupe, which keeps distinct
+    /// matcher keys for `*` vs `Bash`.
+    #[tokio::test]
+    async fn same_command_body_runs_once_for_overlapping_matchers() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("runs");
+        let script = format!(
+            "echo 1 >> '{}'; echo '{{\"decision\":\"allow\"}}'",
+            counter.display()
+        );
+        let bash_group = make_command_spec("bash-hook", Some("Bash"), true, &script);
+        let all_group = make_command_spec("all-hook", None, true, &script);
+        let registry = registry_from_specs(vec![bash_group, all_group]);
+        let result = dispatch_pre_tool_use(
+            &registry,
+            &pre_tool_use_envelope("run_terminal_command"),
+            &run_ctx(),
+        )
+        .await;
+        assert_eq!(result.decision, HookDecision::Allow);
+        let runs = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(
+            runs.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "overlapping matchers must run the shared body once, got: {runs:?}"
+        );
+        assert!(
+            result
+                .results
+                .iter()
+                .any(|r| matches!(r, HookRunResult::Skipped { .. })),
+            "second body should be recorded as Skipped: {:?}",
+            result.results
+        );
     }
 
     #[tokio::test]

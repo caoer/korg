@@ -403,11 +403,51 @@ fn annotations(bash: &BashOutput) -> String {
     s
 }
 
+const NOOP_END_TURN_REMINDER: &str = "<system-reminder>\n\
+    You appear to be running empty commands to stay active while waiting for background work. \
+    End your turn — you will be woken automatically when there is something to do.\n\
+    </system-reminder>";
+
+fn is_noop_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    trimmed.is_empty() || trimmed == "true" || trimmed == ":" || is_pure_status_print(trimmed)
+}
+
+fn is_pure_status_print(trimmed: &str) -> bool {
+    if !(matches!(trimmed, "echo" | "printf")
+        || trimmed.starts_with("echo ")
+        || trimmed.starts_with("printf "))
+    {
+        return false;
+    }
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = trimmed.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !in_single => {
+                chars.next();
+            }
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '$' | '`' if !in_single => return false,
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' | '\n' if !in_single && !in_double => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Build the full DEFAULT prompt text from a `BashOutput`.
 ///
 /// - Normal: `exit: N [annotations]\n<stripped_output>`
 /// - Killed by harness/signal: `exit: killed (reason) [annotations]\n<stripped_output>`
 /// - Backgrounded: verbose `[Command moved to background]...` format.
+/// - No-op / pure status-print foreground commands append
+///   [`NOOP_END_TURN_REMINDER`] so the model ends the turn instead of
+///   re-invoking bash to "stay active" while waiting for background work.
 pub(crate) fn format_default_prompt(bash: &BashOutput) -> String {
     let output_str = if bash.output_for_prompt.is_empty() {
         let raw = String::from_utf8_lossy(&bash.output);
@@ -438,7 +478,12 @@ pub(crate) fn format_default_prompt(bash: &BashOutput) -> String {
             Some(reason) => format!("exit: killed ({}){}", reason, annotations(bash)),
             None => format!("exit: {}{}", bash.exit_code, annotations(bash)),
         };
-        format!("{}\n{}", header, output_str)
+        let prompt = format!("{}\n{}", header, output_str);
+        if bash.signal.is_none() && is_noop_command(&bash.command) {
+            format!("{}\n\n{}", prompt.trim_end(), NOOP_END_TURN_REMINDER)
+        } else {
+            prompt
+        }
     }
 }
 
@@ -3299,11 +3344,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_bash_output(exit_code: i32, output: &str) -> BashOutput {
+        bash_output_with_command("cat file", exit_code, output)
+    }
+
+    fn bash_output_with_command(command: &str, exit_code: i32, output: &str) -> BashOutput {
         let mut bash = BashOutput {
             output: output.as_bytes().to_vec(),
             output_for_prompt: BashOutput::make_output_for_prompt(output),
             exit_code,
-            command: "echo test".to_string(),
+            command: command.to_string(),
             truncated: false,
             signal: None,
             timed_out: false,
@@ -3316,6 +3365,55 @@ mod tests {
         };
         bash.output_for_prompt = format_default_prompt(&bash);
         bash
+    }
+
+    #[test]
+    fn default_prompt_noop_command_appends_end_turn_reminder() {
+        for cmd in [
+            "true",
+            ":",
+            "",
+            "   ",
+            "\t\n",
+            "echo ok",
+            "echo \"Healthy.\"",
+            "echo \"s14=198; s11 full. Healthy.\"",
+            "printf hi",
+            "printf 'done\\n'",
+        ] {
+            let prompt = bash_output_with_command(cmd, 0, "").output_for_prompt;
+            assert!(
+                prompt.contains(NOOP_END_TURN_REMINDER),
+                "no-op command {cmd:?} should append the end-turn reminder, got: {prompt:?}"
+            );
+            assert_eq!(
+                prompt.matches("<system-reminder>").count(),
+                1,
+                "reminder must appear exactly once for {cmd:?}: {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_prompt_normal_command_has_no_end_turn_reminder() {
+        for cmd in [
+            "true && echo hi",
+            "run-true",
+            "grep : file",
+            "cat file",
+            "echo $VAR",
+            "echo x > f",
+            "echo a | cat",
+            "echo $(date)",
+            "echo hi; ls",
+            "printf '%s' \"$x\"",
+        ] {
+            let prompt = bash_output_with_command(cmd, 0, "hi\n").output_for_prompt;
+            assert!(
+                !prompt.contains("<system-reminder>"),
+                "normal command {cmd:?} must not append the end-turn reminder, got: {prompt:?}"
+            );
+        }
     }
 
     #[test]

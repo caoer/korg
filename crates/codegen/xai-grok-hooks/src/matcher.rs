@@ -101,6 +101,41 @@ fn exact_names(pattern: &str) -> Vec<String> {
     names
 }
 
+/// Stable key for load-time hook dedupe of the `matcher` field.
+///
+/// Simple-form patterns (`Bash`, `run_terminal_command`, `|` lists) expand
+/// bidirectionally through the Claude↔Grok name table so alias spellings that
+/// fire on the same tools collapse to one key — e.g. `"Bash"` and
+/// `"run_terminal_command"` both become the sorted set containing both names.
+/// Match-all forms (`None`, `""`, `"*"`) share a single key. Regex patterns
+/// keep their raw string (dispatch-time body dedupe covers residual overlap).
+pub fn matcher_dedupe_key(configured: Option<&str>) -> String {
+    match configured {
+        None => "*".to_owned(),
+        Some(p) if p.is_empty() || p == "*" => "*".to_owned(),
+        Some(p) if is_simple_form(p) => {
+            let mut names = exact_names(p);
+            // Reverse-expand: a Grok-only term (e.g. `run_terminal_command`)
+            // must join every Claude alias that maps onto it (`Bash`), so it
+            // collides with a Claude-side matcher for the same tool.
+            let mut aliases = Vec::new();
+            for name in &names {
+                for alias in claude_names_for(name) {
+                    aliases.push(alias.to_owned());
+                }
+            }
+            for alias in aliases {
+                if !names.iter().any(|n| n == &alias) {
+                    names.push(alias);
+                }
+            }
+            names.sort();
+            names.join("|")
+        }
+        Some(p) => p.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +247,32 @@ mod tests {
         let m = HookMatcher::new("^Bash$").unwrap();
         assert!(m.is_match("run_terminal_command"));
         assert!(m.is_match("Bash"));
+    }
+
+    #[test]
+    fn matcher_dedupe_key_collapses_bash_aliases() {
+        let bash = matcher_dedupe_key(Some("Bash"));
+        let grok = matcher_dedupe_key(Some("run_terminal_command"));
+        assert_eq!(
+            bash, grok,
+            "Claude Bash and Grok run_terminal_command must share a load-time key"
+        );
+        assert!(bash.contains("Bash"));
+        assert!(bash.contains("run_terminal_command"));
+    }
+
+    #[test]
+    fn matcher_dedupe_key_match_all_forms_share_key() {
+        assert_eq!(matcher_dedupe_key(None), "*");
+        assert_eq!(matcher_dedupe_key(Some("")), "*");
+        assert_eq!(matcher_dedupe_key(Some("*")), "*");
+    }
+
+    #[test]
+    fn matcher_dedupe_key_keeps_distinct_tools_apart() {
+        assert_ne!(
+            matcher_dedupe_key(Some("Bash")),
+            matcher_dedupe_key(Some("read_file"))
+        );
     }
 }
