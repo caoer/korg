@@ -166,6 +166,7 @@ pub fn encode_out(ev: &AnthropicOut) -> Vec<String> {
             stop_reason,
             input_tokens,
             output_tokens,
+            cache_read_input_tokens,
         } => {
             let mut usage = serde_json::Map::new();
             if let Some(i) = input_tokens {
@@ -173,6 +174,13 @@ pub fn encode_out(ev: &AnthropicOut) -> Vec<String> {
             }
             if let Some(o) = output_tokens {
                 usage.insert("output_tokens".into(), serde_json::json!(o));
+            }
+            if let Some(c) = cache_read_input_tokens {
+                usage.insert("cache_read_input_tokens".into(), serde_json::json!(c));
+                // The Responses backend exposes no cache-WRITE signal, so this
+                // is always 0 -- emitted anyway because Claude Code treats a
+                // missing key and a zero differently when rendering cost.
+                usage.insert("cache_creation_input_tokens".into(), serde_json::json!(0));
             }
             vec![format_sse_event(
                 "message_delta",
@@ -232,6 +240,7 @@ mod tests {
                     stop_reason: Some("end_turn".into()),
                     input_tokens: Some(1),
                     output_tokens: Some(2),
+                    cache_read_input_tokens: Some(3),
                 },
                 "message_delta",
             ),

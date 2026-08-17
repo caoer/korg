@@ -26,8 +26,14 @@ pub enum AnthropicOut {
     ToolUseStop { index: usize },
     MessageDelta {
         stop_reason: Option<String>,
+        /// Anthropic semantics: UNCACHED prompt tokens only. Upstream's
+        /// `input_tokens` is the full prompt (cache hits included), so the
+        /// cached subset is subtracted out here and reported separately.
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        /// Prompt tokens served from upstream cache
+        /// (`usage.input_tokens_details.cached_tokens`).
+        cache_read_input_tokens: Option<u64>,
     },
     MessageStop,
     Error { message: String },
@@ -281,10 +287,22 @@ impl StreamReducer {
             out.push(AnthropicOut::TextStop { index: idx });
         }
 
-        let (input_tokens, output_tokens) = response
+        // Upstream `input_tokens` is the FULL prompt (uncached + cache hits);
+        // Anthropic's `input_tokens` excludes cache reads and carries them in
+        // `cache_read_input_tokens`. Split here so Claude Code's cost display
+        // and the transcript stop reporting every prompt as a full-price miss.
+        let (input_tokens, output_tokens, cache_read_input_tokens) = response
             .and_then(|r| r.usage.as_ref())
-            .map(|u| (Some(u.input_tokens as u64), Some(u.output_tokens as u64)))
-            .unwrap_or((None, None));
+            .map(|u| {
+                let total = u.input_tokens as u64;
+                let cached = u.input_tokens_details.cached_tokens as u64;
+                (
+                    Some(total.saturating_sub(cached)),
+                    Some(u.output_tokens as u64),
+                    Some(cached),
+                )
+            })
+            .unwrap_or((None, None, None));
 
         let stop_reason = if self.saw_tool {
             Some("tool_use".into())
@@ -296,6 +314,7 @@ impl StreamReducer {
             stop_reason,
             input_tokens,
             output_tokens,
+            cache_read_input_tokens,
         });
         out.push(AnthropicOut::MessageStop);
         self.finished = true;

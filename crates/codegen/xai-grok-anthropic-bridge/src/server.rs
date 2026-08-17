@@ -193,6 +193,7 @@ async fn non_stream_messages(
     let mut stop_reason = "end_turn".to_string();
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
+    let mut cache_read_input_tokens = 0u64;
 
     while let Some(ev) = stream.next().await {
         let ev = ev.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -226,6 +227,7 @@ async fn non_stream_messages(
                     stop_reason: sr,
                     input_tokens: it,
                     output_tokens: ot,
+                    cache_read_input_tokens: cr,
                     ..
                 } => {
                     if let Some(s) = sr {
@@ -236,6 +238,13 @@ async fn non_stream_messages(
                     }
                     if let Some(o) = ot {
                         output_tokens = o;
+                    }
+                    if let Some(c) = cr {
+                        // Scaled with the same factor as input_tokens: the two
+                        // are summed downstream, so scaling only one would
+                        // misreport the total prompt size under --usage-scale.
+                        cache_read_input_tokens =
+                            scale_tokens(c, state.config.usage_scale);
                     }
                 }
                 AnthropicOut::Error { message } => anyhow::bail!("{message}"),
@@ -275,7 +284,9 @@ async fn non_stream_messages(
         "stop_sequence": null,
         "usage": {
             "input_tokens": input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": 0
         }
     }))
 }
