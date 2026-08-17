@@ -144,6 +144,11 @@ impl ChatStateActor {
             trace,
             reasoning_effort: self.state.sampling_config.reasoning_effort,
             json_schema: None,
+            // Native main-turn path. Newer upstream sets this to the session id;
+            // at this commit the field did not exist, so it is pinned to the
+            // conv_id here to match. Not exercised by the bridge, which builds
+            // its own ConversationRequest in translate/request.rs.
+            prompt_cache_key: None,
         }
     }
 }

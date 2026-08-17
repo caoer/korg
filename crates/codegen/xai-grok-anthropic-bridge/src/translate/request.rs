@@ -86,6 +86,19 @@ pub fn translate_messages_request(
         trace: None,
         reasoning_effort,
         json_schema: None,
+        // Sticky prompt-cache routing key. Native grok sets this to the session
+        // id on every main turn (wire-captured by 006be389); this bridge never
+        // could -- the field did not exist and the mapping hardcoded None, so
+        // every request the fleet has ever made went out unpinned. Use the
+        // epoch's conv_id, which is stable for the life of a session and rolls
+        // only when the tool set changes.
+        // Override for A/B: GROK_BRIDGE_NO_CACHE_KEY=1 restores the old
+        // behaviour so the control arm reproduces the failure.
+        prompt_cache_key: if std::env::var("GROK_BRIDGE_NO_CACHE_KEY").is_ok() {
+            None
+        } else {
+            Some(epoch.conv_id.clone())
+        },
     })
 }
 

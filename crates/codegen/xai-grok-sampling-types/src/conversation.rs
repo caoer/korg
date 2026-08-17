@@ -550,6 +550,12 @@ pub struct ConversationRequest {
     pub reasoning_effort: Option<crate::ReasoningEffort>,
     /// JSON Schema for structured output (strict mode).
     pub json_schema: Option<serde_json::Value>,
+    /// Sticky routing key for prompt-cache reuse; overrides `x_grok_conv_id`
+    /// for routing. Backported from HEAD: the native grok CLI sets this to the
+    /// session id on every main turn (confirmed by wire capture), while this
+    /// bridge could not set it at all -- the field did not exist here, and the
+    /// CreateResponse mapping hardcoded None.
+    pub prompt_cache_key: Option<String>,
 }
 
 impl ConversationRequest {
@@ -2161,7 +2167,7 @@ impl From<&ConversationRequest> for rs::CreateResponse {
             parallel_tool_calls: None,
             previous_response_id: None,
             prompt: None,
-            prompt_cache_key: None,
+            prompt_cache_key: req.prompt_cache_key.clone(),
             prompt_cache_retention: None,
             reasoning: Some(rs::Reasoning {
                 effort: req.reasoning_effort.map(|e| e.to_responses_api()),
