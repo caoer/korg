@@ -1,6 +1,11 @@
 //! Axum HTTP surface: Anthropic Messages façade.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
+/// Monotonic sequence for GROK_BRIDGE_DUMP_DIR filenames, so consecutive
+/// outgoing requests sort in send order and diff cleanly pairwise.
+static DUMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use axum::Json;
 use axum::Router;
@@ -100,6 +105,23 @@ async fn messages(
         }
     };
 
+    // Opt-in (GROK_BRIDGE_DUMP_DIR): write the exact CreateResponse body that
+    // will go upstream. Neither log level exposes it -- the streaming path
+    // logs only url/method/headers -- and without the body you cannot tell a
+    // cache miss caused by new content from one caused by the bridge
+    // re-serializing an OLD turn differently. Diffing consecutive dumps finds
+    // the byte where the prefix stops matching. Off unless the env var is set.
+    if let Ok(dump_dir) = std::env::var("GROK_BRIDGE_DUMP_DIR") {
+        let outgoing: xai_grok_sampling_types::rs::CreateResponse = (&translated).into();
+        if let Ok(pretty) = serde_json::to_string_pretty(&outgoing) {
+            let seq = DUMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::path::Path::new(&dump_dir)
+                .join(format!("{seq:04}-{}.json", &epoch.conv_id[..8]));
+            let _ = std::fs::create_dir_all(&dump_dir);
+            let _ = std::fs::write(path, pretty);
+        }
+    }
+
     state.traffic.record_json(
         &req_id,
         TrafficSide::Grok,
@@ -193,6 +215,7 @@ async fn non_stream_messages(
     let mut stop_reason = "end_turn".to_string();
     let mut input_tokens = 0u64;
     let mut output_tokens = 0u64;
+    let mut cache_read_input_tokens = 0u64;
 
     while let Some(ev) = stream.next().await {
         let ev = ev.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -226,6 +249,7 @@ async fn non_stream_messages(
                     stop_reason: sr,
                     input_tokens: it,
                     output_tokens: ot,
+                    cache_read_input_tokens: cr,
                     ..
                 } => {
                     if let Some(s) = sr {
@@ -236,6 +260,13 @@ async fn non_stream_messages(
                     }
                     if let Some(o) = ot {
                         output_tokens = o;
+                    }
+                    if let Some(c) = cr {
+                        // Scaled with the same factor as input_tokens: the two
+                        // are summed downstream, so scaling only one would
+                        // misreport the total prompt size under --usage-scale.
+                        cache_read_input_tokens =
+                            scale_tokens(c, state.config.usage_scale);
                     }
                 }
                 AnthropicOut::Error { message } => anyhow::bail!("{message}"),
@@ -275,7 +306,9 @@ async fn non_stream_messages(
         "stop_sequence": null,
         "usage": {
             "input_tokens": input_tokens,
-            "output_tokens": output_tokens
+            "output_tokens": output_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": 0
         }
     }))
 }
@@ -290,6 +323,17 @@ async fn stream_messages_response(
         .clone()
         .unwrap_or_else(|| state.config.default_model.clone());
     let message_id = format!("msg_{req_id}");
+
+    // Captured before `request` moves into open_conversation_stream. The
+    // upstream cache is keyed on conv_id, and epoch.rs rolls conv_id on every
+    // tools_hash change -- so a reset prefix is only attributable if conv_id
+    // is recorded next to the usage it produced. RUST_LOG=debug would give
+    // this too, but only alongside a full dump of every conversation
+    // (client.rs create_response), which is GB/day at these context sizes.
+    let cache_conv_id = request.x_grok_conv_id.clone().unwrap_or_default();
+    let cache_session_id = request.x_grok_session_id.clone().unwrap_or_default();
+    let cache_turn = request.x_grok_turn_idx.clone().unwrap_or_default();
+    let cache_tools = request.tools.len();
 
     let (tx, rx) = mpsc::channel::<Result<String, String>>(64);
 
@@ -329,6 +373,27 @@ async fn stream_messages_response(
                         json!({"type": event_type_name(&event)}),
                     );
                     for out in reducer.push_event(&event) {
+                        // One compact line per completed turn: enough to join
+                        // cache outcome to conv_id, nothing else. ~200 bytes.
+                        if let AnthropicOut::MessageDelta {
+                            input_tokens: Some(uncached),
+                            cache_read_input_tokens: Some(cached),
+                            output_tokens,
+                            ..
+                        } = &out
+                        {
+                            tracing::info!(
+                                target: "cache_probe",
+                                conv_id = %cache_conv_id,
+                                session_id = %cache_session_id,
+                                turn = %cache_turn,
+                                tools = cache_tools,
+                                uncached = *uncached,
+                                cached = *cached,
+                                output = output_tokens.unwrap_or(0),
+                                "turn_usage"
+                            );
+                        }
                         if let AnthropicOut::Error { message } = &out {
                             // Do not emit here — send once after the loop so we
                             // never mix a partial finish with a duplicate error.
