@@ -33,7 +33,9 @@ pub fn translate_messages_request(
     if let Some(system) = body.get("system") {
         if let Some(text) = system_to_text(system)? {
             if !text.is_empty() {
-                items.push(ConversationItem::system(text));
+                items.push(ConversationItem::system(rewrite_system_identity(
+                    &text, &model,
+                )));
             }
         }
     }
@@ -44,7 +46,7 @@ pub fn translate_messages_request(
         .ok_or_else(|| TranslateError::Message("messages must be an array".into()))?;
 
     for msg in messages {
-        push_message(msg, &mut items)?;
+        push_message(msg, &mut items, &model)?;
     }
 
     let (tools, hosted_tools) = parse_tools(body.get("tools"))?;
@@ -161,6 +163,64 @@ fn system_to_text(system: &Value) -> Result<Option<String>, TranslateError> {
     }
 }
 
+/// Native grok identity: `You are Grok 4.6 released by xAI.`
+fn grok_identity_line(model: &str) -> String {
+    let label = model
+        .strip_prefix("grok-")
+        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        .map(|rest| format!("Grok {rest}"))
+        .unwrap_or_else(|| "Grok".to_string());
+    format!("You are {label} released by xAI.")
+}
+
+/// Drop Claude Code's billing header and Claude identity, then open with the
+/// native grok identity. Leaves the rest of the harness (permissions, hooks,
+/// tools) intact — those are how Claude Code works, not who the model is.
+fn rewrite_system_identity(raw: &str, model: &str) -> String {
+    let s = strip_billing_header(raw);
+    let s = strip_claude_identity(s);
+    if s.starts_with("You are Grok") {
+        return s.to_string();
+    }
+    let identity = grok_identity_line(model);
+    if s.is_empty() {
+        return identity;
+    }
+    if s.starts_with('\n') {
+        format!("{identity}{s}")
+    } else {
+        format!("{identity} {s}")
+    }
+}
+
+fn strip_billing_header(s: &str) -> &str {
+    let t = s.trim_start();
+    const PREFIX: &str = "x-anthropic-billing-header:";
+    if !t.starts_with(PREFIX) {
+        return t;
+    }
+    let after = &t[PREFIX.len()..];
+    after
+        .find("You are")
+        .map(|i| after[i..].trim_start())
+        .unwrap_or("")
+}
+
+fn strip_claude_identity(s: &str) -> &str {
+    const IDENTITIES: &[&str] = &[
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    ];
+    let mut t = s.trim_start();
+    loop {
+        let Some(id) = IDENTITIES.iter().copied().find(|id| t.starts_with(id)) else {
+            break;
+        };
+        t = t[id.len()..].trim_start();
+    }
+    t
+}
+
 /// Fold mid-conversation `role: system` messages into user items so the
 /// upstream conversation carries exactly one system item, at index 0 -- the
 /// shape the native grok client sends. On by default; `0`/`false`/`off`
@@ -172,7 +232,11 @@ fn fold_mid_system() -> bool {
     }
 }
 
-fn push_message(msg: &Value, items: &mut Vec<ConversationItem>) -> Result<(), TranslateError> {
+fn push_message(
+    msg: &Value,
+    items: &mut Vec<ConversationItem>,
+    model: &str,
+) -> Result<(), TranslateError> {
     let role = msg
         .get("role")
         .and_then(Value::as_str)
@@ -196,6 +260,11 @@ fn push_message(msg: &Value, items: &mut Vec<ConversationItem>) -> Result<(), Tr
                     if fold_mid_system() && !items.is_empty() {
                         items.push(ConversationItem::user(text));
                     } else {
+                        let text = if items.is_empty() {
+                            rewrite_system_identity(&text, model)
+                        } else {
+                            text
+                        };
                         items.push(ConversationItem::system(text));
                     }
                 }
@@ -621,5 +690,95 @@ mod tests {
             ),
             "mid-conversation system must fold into a user item"
         );
+    }
+
+    fn system_content(item: &ConversationItem) -> &str {
+        match item {
+            ConversationItem::System(s) => s.content.as_ref(),
+            _ => panic!("expected system item"),
+        }
+    }
+
+    fn epoch() -> crate::SessionEpoch {
+        crate::SessionEpoch {
+            claude_session_id: "s".into(),
+            grok_session_id: "s".into(),
+            conv_id: "c".into(),
+            turn: 1,
+            tools_hash: None,
+            epoch: 0,
+        }
+    }
+
+    #[test]
+    fn rewrites_claude_identity_to_native_grok() {
+        let body = json!({
+            "model": "grok-4.6",
+            "max_tokens": 64,
+            "system": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.226.678; cc_entrypoint=sdk-cli;"},
+                {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+                {"type": "text", "text": "\nYou are an interactive agent that helps users with software engineering tasks.\n\n# Harness\n"}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = translate_messages_request(&body, &epoch(), "grok-4.6", "r1").unwrap();
+        let sys = system_content(&req.items[0]);
+        assert!(
+            sys.starts_with("You are Grok 4.6 released by xAI."),
+            "identity: {sys}"
+        );
+        assert!(
+            !sys.contains("x-anthropic-billing-header"),
+            "billing header must go: {sys}"
+        );
+        assert!(
+            !sys.contains("Claude agent"),
+            "claude identity must go: {sys}"
+        );
+        assert!(
+            sys.contains("You are an interactive agent that helps users with software engineering tasks."),
+            "harness body must stay: {sys}"
+        );
+        assert!(sys.contains("# Harness"), "harness body must stay: {sys}");
+    }
+
+    #[test]
+    fn rewrites_concatenated_claude_code_identity() {
+        let body = json!({
+            "model": "grok-4.5",
+            "max_tokens": 64,
+            "system": "x-anthropic-billing-header: cc_version=2.1.220.944; cc_entrypoint=cli;You are Claude Code, Anthropic's official CLI for Claude.\nYou are an interactive agent that helps users with software engineering tasks.",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = translate_messages_request(&body, &epoch(), "grok-4.5", "r1").unwrap();
+        let sys = system_content(&req.items[0]);
+        assert!(sys.starts_with("You are Grok 4.5 released by xAI."));
+        assert!(!sys.contains("x-anthropic-billing-header"));
+        assert!(!sys.contains("Claude Code"));
+        assert!(sys.contains("interactive agent"));
+    }
+
+    #[test]
+    fn does_not_rewrite_folded_mid_system() {
+        let body = json!({
+            "model": "grok-4.6",
+            "max_tokens": 64,
+            "system": "You are Grok 4.6 released by xAI.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": "Available agent types for the Agent tool:"}
+            ]
+        });
+        let req = translate_messages_request(&body, &epoch(), "grok-4.6", "r1").unwrap();
+        match &req.items[2] {
+            ConversationItem::User(u) => match u.content.as_slice() {
+                [xai_grok_sampling_types::conversation::ContentPart::Text { text }] => {
+                    assert_eq!(text.as_ref(), "Available agent types for the Agent tool:");
+                }
+                other => panic!("expected single text part, got {other:?}"),
+            },
+            other => panic!("expected folded user item, got {other:?}"),
+        }
     }
 }
