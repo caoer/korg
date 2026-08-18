@@ -161,6 +161,19 @@ fn system_to_text(system: &Value) -> Result<Option<String>, TranslateError> {
     }
 }
 
+/// Opt-in: fold mid-conversation `role: system` messages into user items so the
+/// upstream conversation carries exactly one system item, at index 0 -- the
+/// shape the native grok client sends. Off by default; read once.
+fn fold_mid_system() -> bool {
+    static FOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOLD.get_or_init(|| {
+        matches!(
+            std::env::var("GROK_BRIDGE_FOLD_MID_SYSTEM").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 fn push_message(msg: &Value, items: &mut Vec<ConversationItem>) -> Result<(), TranslateError> {
     let role = msg
         .get("role")
@@ -169,10 +182,24 @@ fn push_message(msg: &Value, items: &mut Vec<ConversationItem>) -> Result<(), Tr
     match role {
         // Claude Code often puts system blocks in `messages[]` as well as
         // top-level `system`. Map both to ConversationItem::system.
+        //
+        // But a system item APPENDED mid-conversation stops the server from
+        // extending its prefix cache: measured over two independent mode-B
+        // runs (trackC `dumpcreep`, `dump180`), 20 of 20 turns whose appended
+        // region carried a system item came back truncated, and 2 of 2 turns
+        // whose appended region carried none came back >=99.9% healthy --
+        // perfect separation, 22/22. Native grok-shell never emits a system
+        // item after index 0. GROK_BRIDGE_FOLD_MID_SYSTEM=1 matches that
+        // shape: the first system item stays a system item, every later one
+        // is folded in as user text.
         "system" => {
             if let Some(text) = content_to_plain_text(msg.get("content"))? {
                 if !text.is_empty() {
-                    items.push(ConversationItem::system(text));
+                    if fold_mid_system() && !items.is_empty() {
+                        items.push(ConversationItem::user(text));
+                    } else {
+                        items.push(ConversationItem::system(text));
+                    }
                 }
             }
             Ok(())
