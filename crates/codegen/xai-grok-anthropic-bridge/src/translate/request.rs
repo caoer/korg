@@ -161,17 +161,15 @@ fn system_to_text(system: &Value) -> Result<Option<String>, TranslateError> {
     }
 }
 
-/// Opt-in: fold mid-conversation `role: system` messages into user items so the
+/// Fold mid-conversation `role: system` messages into user items so the
 /// upstream conversation carries exactly one system item, at index 0 -- the
-/// shape the native grok client sends. Off by default; read once.
+/// shape the native grok client sends. On by default; `0`/`false`/`off`
+/// restores the old mapping (every system message stays `role: system`).
 fn fold_mid_system() -> bool {
-    static FOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FOLD.get_or_init(|| {
-        matches!(
-            std::env::var("GROK_BRIDGE_FOLD_MID_SYSTEM").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
+    match std::env::var("GROK_BRIDGE_FOLD_MID_SYSTEM") {
+        Ok(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => false,
+        _ => true,
+    }
 }
 
 fn push_message(msg: &Value, items: &mut Vec<ConversationItem>) -> Result<(), TranslateError> {
@@ -189,9 +187,9 @@ fn push_message(msg: &Value, items: &mut Vec<ConversationItem>) -> Result<(), Tr
         // region carried a system item came back truncated, and 2 of 2 turns
         // whose appended region carried none came back >=99.9% healthy --
         // perfect separation, 22/22. Native grok-shell never emits a system
-        // item after index 0. GROK_BRIDGE_FOLD_MID_SYSTEM=1 matches that
+        // item after index 0. Fold is on by default and matches that
         // shape: the first system item stays a system item, every later one
-        // is folded in as user text.
+        // is folded in as user text. GROK_BRIDGE_FOLD_MID_SYSTEM=0 disables.
         "system" => {
             if let Some(text) = content_to_plain_text(msg.get("content"))? {
                 if !text.is_empty() {
@@ -577,5 +575,51 @@ mod tests {
             &req.items[0],
             xai_grok_sampling_types::conversation::ConversationItem::System(_)
         ));
+    }
+
+    #[test]
+    fn folds_mid_conversation_system_into_user() {
+        let body = json!({
+            "model": "grok-4.5",
+            "max_tokens": 64,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "system", "content": "<hook context>"},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        let epoch = crate::SessionEpoch {
+            claude_session_id: "s".into(),
+            grok_session_id: "s".into(),
+            conv_id: "c".into(),
+            turn: 1,
+            tools_hash: None,
+            epoch: 0,
+        };
+        let req = translate_messages_request(&body, &epoch, "grok-4.5", "r1").unwrap();
+        assert!(matches!(
+            &req.items[0],
+            xai_grok_sampling_types::conversation::ConversationItem::System(_)
+        ));
+        let system_count = req
+            .items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    xai_grok_sampling_types::conversation::ConversationItem::System(_)
+                )
+            })
+            .count();
+        assert_eq!(system_count, 1, "only the leading system item should remain");
+        assert!(
+            matches!(
+                &req.items[3],
+                xai_grok_sampling_types::conversation::ConversationItem::User(_)
+            ),
+            "mid-conversation system must fold into a user item"
+        );
     }
 }
